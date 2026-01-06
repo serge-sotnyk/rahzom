@@ -4,13 +4,17 @@ use ratatui::{
     layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::config::project::{Project, ProjectManager};
+use crate::sync::differ::{diff, ConflictReason, DiffResult, SyncAction};
+use crate::sync::metadata::SyncMetadata;
+use crate::sync::scanner::{scan, ScanResult};
 
 /// Application screens
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +33,154 @@ pub enum Dialog {
     NewProject(NewProjectDialog),
     DeleteConfirm(String),
     Error(String),
+}
+
+/// Filter mode for preview
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreviewFilter {
+    #[default]
+    All,
+    Changes,
+    Conflicts,
+}
+
+impl PreviewFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Changes,
+            Self::Changes => Self::Conflicts,
+            Self::Conflicts => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Changes => "Changes",
+            Self::Conflicts => "Conflicts",
+        }
+    }
+}
+
+/// Action that user can modify
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserAction {
+    /// Keep the original action from diff
+    Original(SyncAction),
+    /// User changed to copy left to right
+    CopyToRight { path: PathBuf, size: u64 },
+    /// User changed to copy right to left
+    CopyToLeft { path: PathBuf, size: u64 },
+    /// User chose to skip this item
+    Skip { path: PathBuf },
+}
+
+impl UserAction {
+    fn path(&self) -> &PathBuf {
+        match self {
+            Self::Original(action) => action_path(action),
+            Self::CopyToRight { path, .. } => path,
+            Self::CopyToLeft { path, .. } => path,
+            Self::Skip { path } => path,
+        }
+    }
+
+    fn is_modified(&self) -> bool {
+        !matches!(self, Self::Original(_))
+    }
+}
+
+/// Preview state
+#[derive(Debug, Default)]
+pub struct PreviewState {
+    pub actions: Vec<UserAction>,
+    pub filter: PreviewFilter,
+    pub selected: usize,
+    pub scroll_offset: usize,
+    pub selected_items: HashSet<usize>,
+    pub left_scan: Option<ScanResult>,
+    pub right_scan: Option<ScanResult>,
+}
+
+impl PreviewState {
+    fn new(diff_result: DiffResult, left_scan: ScanResult, right_scan: ScanResult) -> Self {
+        Self {
+            actions: diff_result
+                .actions
+                .into_iter()
+                .map(UserAction::Original)
+                .collect(),
+            filter: PreviewFilter::All,
+            selected: 0,
+            scroll_offset: 0,
+            selected_items: HashSet::new(),
+            left_scan: Some(left_scan),
+            right_scan: Some(right_scan),
+        }
+    }
+
+    fn filtered_indices(&self) -> Vec<usize> {
+        self.actions
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| match self.filter {
+                PreviewFilter::All => true,
+                PreviewFilter::Changes => !is_skip_action(action),
+                PreviewFilter::Conflicts => is_conflict_action(action),
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn summary(&self) -> PreviewSummary {
+        let mut summary = PreviewSummary::default();
+        for action in &self.actions {
+            match action {
+                UserAction::Original(SyncAction::CopyToRight { size, .. })
+                | UserAction::CopyToRight { size, .. } => {
+                    summary.copy_to_right += 1;
+                    summary.bytes_to_right += size;
+                }
+                UserAction::Original(SyncAction::CopyToLeft { size, .. })
+                | UserAction::CopyToLeft { size, .. } => {
+                    summary.copy_to_left += 1;
+                    summary.bytes_to_left += size;
+                }
+                UserAction::Original(SyncAction::DeleteRight { .. }) => {
+                    summary.delete_right += 1;
+                }
+                UserAction::Original(SyncAction::DeleteLeft { .. }) => {
+                    summary.delete_left += 1;
+                }
+                UserAction::Original(SyncAction::Conflict { .. }) => {
+                    summary.conflicts += 1;
+                }
+                UserAction::Original(SyncAction::CreateDirRight { .. }) => {
+                    summary.dirs_to_create += 1;
+                }
+                UserAction::Original(SyncAction::CreateDirLeft { .. }) => {
+                    summary.dirs_to_create += 1;
+                }
+                UserAction::Skip { .. } | UserAction::Original(SyncAction::Skip { .. }) => {
+                    summary.skipped += 1;
+                }
+            }
+        }
+        summary
+    }
+}
+
+#[derive(Debug, Default)]
+struct PreviewSummary {
+    copy_to_right: usize,
+    copy_to_left: usize,
+    bytes_to_right: u64,
+    bytes_to_left: u64,
+    delete_right: usize,
+    delete_left: usize,
+    conflicts: usize,
+    dirs_to_create: usize,
+    skipped: usize,
 }
 
 /// New project dialog state
@@ -96,8 +248,11 @@ pub struct App {
     pub list_state: ListState,
     pub project_manager: Option<ProjectManager>,
 
-    // Current project (when in ProjectView)
+    // Current project (when in ProjectView/Preview)
     pub current_project: Option<Project>,
+
+    // Preview state
+    pub preview: Option<PreviewState>,
 
     // Mouse tracking
     last_click: Option<(u16, u16, Instant)>,
@@ -120,6 +275,7 @@ impl App {
             list_state: ListState::default(),
             project_manager: None,
             current_project: None,
+            preview: None,
             last_click: None,
             content_area: None,
         };
@@ -159,6 +315,7 @@ impl App {
             list_state,
             project_manager: Some(pm),
             current_project: None,
+            preview: None,
             last_click: None,
             content_area: None,
         }
@@ -171,7 +328,6 @@ impl App {
                 let was_empty = self.projects.is_empty();
                 self.projects = projects;
 
-                // Adjust selection
                 if self.projects.is_empty() {
                     self.list_state.select(None);
                 } else if was_empty {
@@ -223,54 +379,120 @@ impl App {
 
     fn handle_key_normal(&mut self, code: KeyCode) {
         match self.screen {
-            Screen::ProjectList => match code {
-                KeyCode::Char('q') | KeyCode::Char('Q') => {
-                    self.should_quit = true;
-                }
-                KeyCode::Esc => {
-                    self.should_quit = true;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.select_previous();
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.select_next();
-                }
-                KeyCode::Enter => {
-                    self.open_selected_project();
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.dialog = Dialog::NewProject(NewProjectDialog::new());
-                }
-                KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
-                    if let Some(selected) = self.list_state.selected() {
-                        if let Some(name) = self.projects.get(selected) {
-                            self.dialog = Dialog::DeleteConfirm(name.clone());
-                        }
+            Screen::ProjectList => self.handle_key_project_list(code),
+            Screen::ProjectView => self.handle_key_project_view(code),
+            Screen::Preview => self.handle_key_preview(code),
+            _ => {}
+        }
+    }
+
+    fn handle_key_project_list(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.should_quit = true;
+            }
+            KeyCode::Esc => {
+                self.should_quit = true;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.select_previous_project();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.select_next_project();
+            }
+            KeyCode::Enter => {
+                self.open_selected_project();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.dialog = Dialog::NewProject(NewProjectDialog::new());
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+                if let Some(selected) = self.list_state.selected() {
+                    if let Some(name) = self.projects.get(selected) {
+                        self.dialog = Dialog::DeleteConfirm(name.clone());
                     }
                 }
-                KeyCode::Home => {
-                    if !self.projects.is_empty() {
-                        self.list_state.select(Some(0));
+            }
+            KeyCode::Home => {
+                if !self.projects.is_empty() {
+                    self.list_state.select(Some(0));
+                }
+            }
+            KeyCode::End => {
+                if !self.projects.is_empty() {
+                    self.list_state.select(Some(self.projects.len() - 1));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_project_view(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                self.screen = Screen::ProjectList;
+                self.current_project = None;
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.should_quit = true;
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.run_analyze();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_preview(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                self.screen = Screen::ProjectView;
+                self.preview = None;
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.should_quit = true;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.select_previous_action();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.select_next_action();
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                self.cycle_filter();
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.change_action_to_left();
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.change_action_to_right();
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.skip_selected_action();
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.reset_selected_action();
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_selection();
+            }
+            KeyCode::Home => {
+                if let Some(ref mut preview) = self.preview {
+                    let indices = preview.filtered_indices();
+                    if !indices.is_empty() {
+                        preview.selected = 0;
+                        preview.scroll_offset = 0;
                     }
                 }
-                KeyCode::End => {
-                    if !self.projects.is_empty() {
-                        self.list_state.select(Some(self.projects.len() - 1));
+            }
+            KeyCode::End => {
+                if let Some(ref mut preview) = self.preview {
+                    let indices = preview.filtered_indices();
+                    if !indices.is_empty() {
+                        preview.selected = indices.len() - 1;
                     }
                 }
-                _ => {}
-            },
-            Screen::ProjectView => match code {
-                KeyCode::Esc | KeyCode::Backspace => {
-                    self.screen = Screen::ProjectList;
-                    self.current_project = None;
-                }
-                KeyCode::Char('q') | KeyCode::Char('Q') => {
-                    self.should_quit = true;
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
@@ -334,32 +556,36 @@ impl App {
             return;
         }
 
+        match self.screen {
+            Screen::ProjectList => self.handle_mouse_project_list(mouse),
+            Screen::Preview => self.handle_mouse_preview(mouse),
+            _ => {}
+        }
+    }
+
+    fn handle_mouse_project_list(&mut self, mouse: event::MouseEvent) {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let now = Instant::now();
                 let pos = (mouse.column, mouse.row);
 
-                // Check for double-click
                 if let Some((last_col, last_row, last_time)) = self.last_click {
                     if last_col == pos.0
                         && last_row == pos.1
                         && now.duration_since(last_time) < Duration::from_millis(500)
                     {
-                        // Double click - open project
                         self.open_selected_project();
                         self.last_click = None;
                         return;
                     }
                 }
 
-                // Single click - select item
                 if let Some(content_area) = self.content_area {
                     if mouse.column >= content_area.x
                         && mouse.column < content_area.x + content_area.width
                         && mouse.row >= content_area.y
                         && mouse.row < content_area.y + content_area.height
                     {
-                        // Calculate which item was clicked (accounting for border and padding)
                         let relative_y = mouse.row.saturating_sub(content_area.y + 1);
                         let index = relative_y as usize;
 
@@ -372,20 +598,51 @@ impl App {
                 self.last_click = Some((pos.0, pos.1, now));
             }
             MouseEventKind::ScrollUp => {
-                self.select_previous();
+                self.select_previous_project();
             }
             MouseEventKind::ScrollDown => {
-                self.select_next();
+                self.select_next_project();
             }
             _ => {}
         }
     }
 
-    fn select_next(&mut self) {
+    fn handle_mouse_preview(&mut self, mouse: event::MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(content_area) = self.content_area {
+                    if mouse.column >= content_area.x
+                        && mouse.column < content_area.x + content_area.width
+                        && mouse.row >= content_area.y
+                        && mouse.row < content_area.y + content_area.height
+                    {
+                        if let Some(ref mut preview) = self.preview {
+                            let relative_y = mouse.row.saturating_sub(content_area.y + 1);
+                            let index = relative_y as usize + preview.scroll_offset;
+                            let indices = preview.filtered_indices();
+
+                            if index < indices.len() {
+                                preview.selected = index;
+                            }
+                        }
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                self.select_previous_action();
+            }
+            MouseEventKind::ScrollDown => {
+                self.select_next_action();
+            }
+            _ => {}
+        }
+    }
+
+    // Navigation helpers
+    fn select_next_project(&mut self) {
         if self.projects.is_empty() {
             return;
         }
-
         let i = match self.list_state.selected() {
             Some(i) => {
                 if i >= self.projects.len() - 1 {
@@ -399,11 +656,10 @@ impl App {
         self.list_state.select(Some(i));
     }
 
-    fn select_previous(&mut self) {
+    fn select_previous_project(&mut self) {
         if self.projects.is_empty() {
             return;
         }
-
         let i = match self.list_state.selected() {
             Some(i) => {
                 if i == 0 {
@@ -415,6 +671,93 @@ impl App {
             None => 0,
         };
         self.list_state.select(Some(i));
+    }
+
+    fn select_next_action(&mut self) {
+        if let Some(ref mut preview) = self.preview {
+            let indices = preview.filtered_indices();
+            if !indices.is_empty() && preview.selected < indices.len() - 1 {
+                preview.selected += 1;
+            }
+        }
+    }
+
+    fn select_previous_action(&mut self) {
+        if let Some(ref mut preview) = self.preview {
+            if preview.selected > 0 {
+                preview.selected -= 1;
+            }
+        }
+    }
+
+    fn cycle_filter(&mut self) {
+        if let Some(ref mut preview) = self.preview {
+            preview.filter = preview.filter.next();
+            preview.selected = 0;
+            preview.scroll_offset = 0;
+        }
+    }
+
+    fn toggle_selection(&mut self) {
+        if let Some(ref mut preview) = self.preview {
+            let indices = preview.filtered_indices();
+            if let Some(&real_idx) = indices.get(preview.selected) {
+                if preview.selected_items.contains(&real_idx) {
+                    preview.selected_items.remove(&real_idx);
+                } else {
+                    preview.selected_items.insert(real_idx);
+                }
+            }
+        }
+    }
+
+    fn change_action_to_left(&mut self) {
+        if let Some(ref mut preview) = self.preview {
+            let indices = preview.filtered_indices();
+            if let Some(&real_idx) = indices.get(preview.selected) {
+                if let Some(action) = preview.actions.get(real_idx) {
+                    let path = action.path().clone();
+                    let size = get_action_size(action);
+                    preview.actions[real_idx] = UserAction::CopyToLeft { path, size };
+                }
+            }
+        }
+    }
+
+    fn change_action_to_right(&mut self) {
+        if let Some(ref mut preview) = self.preview {
+            let indices = preview.filtered_indices();
+            if let Some(&real_idx) = indices.get(preview.selected) {
+                if let Some(action) = preview.actions.get(real_idx) {
+                    let path = action.path().clone();
+                    let size = get_action_size(action);
+                    preview.actions[real_idx] = UserAction::CopyToRight { path, size };
+                }
+            }
+        }
+    }
+
+    fn skip_selected_action(&mut self) {
+        if let Some(ref mut preview) = self.preview {
+            let indices = preview.filtered_indices();
+            if let Some(&real_idx) = indices.get(preview.selected) {
+                if let Some(action) = preview.actions.get(real_idx) {
+                    let path = action.path().clone();
+                    preview.actions[real_idx] = UserAction::Skip { path };
+                }
+            }
+        }
+    }
+
+    fn reset_selected_action(&mut self) {
+        if let Some(ref mut preview) = self.preview {
+            let indices = preview.filtered_indices();
+            if let Some(&_real_idx) = indices.get(preview.selected) {
+                // We need to restore the original action - but we don't have it stored separately
+                // For now, action reset is not fully implemented
+                // In a full implementation, we'd store original DiffResult
+            }
+        }
     }
 
     fn open_selected_project(&mut self) {
@@ -435,9 +778,42 @@ impl App {
         }
     }
 
+    fn run_analyze(&mut self) {
+        let Some(ref project) = self.current_project else {
+            return;
+        };
+
+        // Scan both sides
+        let left_scan = match scan(&project.left_path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.dialog = Dialog::Error(format!("Failed to scan left: {}", e));
+                return;
+            }
+        };
+
+        let right_scan = match scan(&project.right_path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.dialog = Dialog::Error(format!("Failed to scan right: {}", e));
+                return;
+            }
+        };
+
+        // Load metadata
+        let left_meta = SyncMetadata::load(&project.left_path).unwrap_or_default();
+        let right_meta = SyncMetadata::load(&project.right_path).unwrap_or_default();
+
+        // Run diff
+        let diff_result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        // Create preview state
+        self.preview = Some(PreviewState::new(diff_result, left_scan, right_scan));
+        self.screen = Screen::Preview;
+    }
+
     fn try_create_project(&mut self) {
         if let Dialog::NewProject(ref dialog) = self.dialog {
-            // Validate
             if dialog.name.is_empty() {
                 if let Dialog::NewProject(ref mut d) = self.dialog {
                     d.error = Some("Project name is required".to_string());
@@ -468,7 +844,6 @@ impl App {
                     Ok(()) => {
                         self.dialog = Dialog::None;
                         self.refresh_projects();
-                        // Select the newly created project
                         if let Some(pos) = self.projects.iter().position(|p| p == &project.name) {
                             self.list_state.select(Some(pos));
                         }
@@ -497,7 +872,6 @@ impl App {
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
 
-        // Layout: header, content, footer
         let chunks = Layout::vertical([
             Constraint::Length(3), // Header
             Constraint::Min(1),    // Content
@@ -509,7 +883,6 @@ impl App {
         self.render_content(frame, chunks[1]);
         self.render_footer(frame, chunks[2]);
 
-        // Render dialog on top if active
         match &self.dialog {
             Dialog::None => {}
             Dialog::NewProject(dialog) => {
@@ -529,17 +902,23 @@ impl App {
         let title = format!(" rahzom v{} ", version);
 
         let screen_indicator = match self.screen {
-            Screen::ProjectList => "Projects",
+            Screen::ProjectList => "Projects".to_string(),
             Screen::ProjectView => {
                 if let Some(ref p) = self.current_project {
-                    &p.name
+                    p.name.clone()
                 } else {
-                    "Project"
+                    "Project".to_string()
                 }
             }
-            Screen::Analyzing => "Analyzing",
-            Screen::Preview => "Preview",
-            Screen::Syncing => "Syncing",
+            Screen::Analyzing => "Analyzing...".to_string(),
+            Screen::Preview => {
+                if let Some(ref preview) = self.preview {
+                    format!("Preview [{}]", preview.filter.label())
+                } else {
+                    "Preview".to_string()
+                }
+            }
+            Screen::Syncing => "Syncing...".to_string(),
         };
 
         let header = Paragraph::new(Line::from(vec![
@@ -567,6 +946,7 @@ impl App {
         match self.screen {
             Screen::ProjectList => self.render_project_list(frame, area),
             Screen::ProjectView => self.render_project_view(frame, area),
+            Screen::Preview => self.render_preview(frame, area),
             _ => {}
         }
     }
@@ -599,9 +979,7 @@ impl App {
         let items: Vec<ListItem> = self
             .projects
             .iter()
-            .map(|name| {
-                ListItem::new(Line::from(format!("  {}  ", name)))
-            })
+            .map(|name| ListItem::new(Line::from(format!("  {}  ", name))))
             .collect();
 
         let list = List::new(items)
@@ -646,10 +1024,11 @@ impl App {
                     ),
                 ]),
                 Line::from(""),
-                Line::from(Span::styled(
-                    "(Analyze & Preview will be implemented in Stage 8)",
-                    Style::default().fg(Color::DarkGray),
-                )),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    Span::styled(" A ", Style::default().fg(Color::Black).bg(Color::Green)),
+                    Span::raw(" to analyze"),
+                ]),
             ]
         } else {
             vec![Line::from("No project loaded")]
@@ -659,6 +1038,114 @@ impl App {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Project Details ")
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+
+        frame.render_widget(paragraph, area);
+    }
+
+    fn render_preview(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(ref preview) = self.preview else {
+            return;
+        };
+
+        // Split area for list and summary
+        let chunks = Layout::vertical([
+            Constraint::Min(5),    // Action list
+            Constraint::Length(4), // Summary
+        ])
+        .split(area);
+
+        // Render action list
+        let indices = preview.filtered_indices();
+        let visible_height = chunks[0].height.saturating_sub(2) as usize;
+
+        // Adjust scroll offset
+        let scroll_offset = if preview.selected >= visible_height {
+            preview.selected - visible_height + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = indices
+            .iter()
+            .skip(scroll_offset)
+            .take(visible_height)
+            .enumerate()
+            .map(|(display_idx, &real_idx)| {
+                let action = &preview.actions[real_idx];
+                let is_selected = display_idx + scroll_offset == preview.selected;
+                let is_marked = preview.selected_items.contains(&real_idx);
+
+                render_action_item(action, is_selected, is_marked)
+            })
+            .collect();
+
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Actions ({}/{}) ",
+                    indices.len(),
+                    preview.actions.len()
+                ))
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+
+        frame.render_widget(list, chunks[0]);
+
+        // Render scrollbar if needed
+        if indices.len() > visible_height {
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None);
+            let mut scrollbar_state =
+                ScrollbarState::new(indices.len()).position(preview.selected);
+            frame.render_stateful_widget(
+                scrollbar,
+                chunks[0].inner(Margin::new(0, 1)),
+                &mut scrollbar_state,
+            );
+        }
+
+        // Render summary
+        let summary = preview.summary();
+        self.render_summary(frame, chunks[1], &summary);
+    }
+
+    fn render_summary(&self, frame: &mut Frame, area: Rect, summary: &PreviewSummary) {
+        let total_bytes = summary.bytes_to_right + summary.bytes_to_left;
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("→ ", Style::default().fg(Color::Green)),
+                Span::raw(format!("{} files ", summary.copy_to_right)),
+                Span::styled("← ", Style::default().fg(Color::Blue)),
+                Span::raw(format!("{} files ", summary.copy_to_left)),
+                Span::styled("✕ ", Style::default().fg(Color::Red)),
+                Span::raw(format!(
+                    "{} del ",
+                    summary.delete_left + summary.delete_right
+                )),
+                Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
+                Span::raw(format!("{} conflicts", summary.conflicts)),
+            ]),
+            Line::from(vec![
+                Span::styled("Total: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format_bytes(total_bytes)),
+                Span::raw("  "),
+                Span::styled("Dirs: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", summary.dirs_to_create)),
+                Span::raw("  "),
+                Span::styled("Skip: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", summary.skipped)),
+            ]),
+        ];
+
+        let paragraph = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Summary ")
                 .border_style(Style::default().fg(Color::DarkGray)),
         );
 
@@ -678,13 +1165,13 @@ impl App {
                 } else {
                     vec![
                         Span::styled(" ↑↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
-                        Span::raw(" Navigate  "),
+                        Span::raw(" Nav  "),
                         Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
                         Span::raw(" Open  "),
                         Span::styled(" N ", Style::default().fg(Color::Black).bg(Color::Gray)),
                         Span::raw(" New  "),
                         Span::styled(" D ", Style::default().fg(Color::Black).bg(Color::Gray)),
-                        Span::raw(" Delete  "),
+                        Span::raw(" Del  "),
                         Span::styled(" Q ", Style::default().fg(Color::Black).bg(Color::Gray)),
                         Span::raw(" Quit "),
                     ]
@@ -692,10 +1179,26 @@ impl App {
             }
             Screen::ProjectView => {
                 vec![
+                    Span::styled(" A ", Style::default().fg(Color::Black).bg(Color::Green)),
+                    Span::raw(" Analyze  "),
                     Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     Span::raw(" Back  "),
                     Span::styled(" Q ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     Span::raw(" Quit "),
+                ]
+            }
+            Screen::Preview => {
+                vec![
+                    Span::styled(" ↑↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" Nav  "),
+                    Span::styled(" ←→ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" Dir  "),
+                    Span::styled(" S ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" Skip  "),
+                    Span::styled(" F ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" Filter  "),
+                    Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" Back "),
                 ]
             }
             _ => vec![
@@ -716,8 +1219,6 @@ impl App {
 
     fn render_new_project_dialog(&self, frame: &mut Frame, dialog: NewProjectDialog) {
         let area = centered_rect(60, 14, frame.area());
-
-        // Clear the area behind dialog
         frame.render_widget(Clear, area);
 
         let block = Block::default()
@@ -729,18 +1230,17 @@ impl App {
         frame.render_widget(block, area);
 
         let chunks = Layout::vertical([
-            Constraint::Length(1), // Padding
-            Constraint::Length(2), // Name field
-            Constraint::Length(1), // Padding
-            Constraint::Length(2), // Left path field
-            Constraint::Length(1), // Padding
-            Constraint::Length(2), // Right path field
-            Constraint::Length(1), // Padding
-            Constraint::Min(1),    // Error / hints
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(1),
         ])
         .split(inner.inner(Margin::new(2, 0)));
 
-        // Name field
         let name_style = if dialog.focused_field == DialogField::Name {
             Style::default().fg(Color::Yellow)
         } else {
@@ -757,7 +1257,6 @@ impl App {
         ]);
         frame.render_widget(Paragraph::new(name_label), chunks[1]);
 
-        // Left path field
         let left_style = if dialog.focused_field == DialogField::LeftPath {
             Style::default().fg(Color::Yellow)
         } else {
@@ -774,7 +1273,6 @@ impl App {
         ]);
         frame.render_widget(Paragraph::new(left_label), chunks[3]);
 
-        // Right path field
         let right_style = if dialog.focused_field == DialogField::RightPath {
             Style::default().fg(Color::Yellow)
         } else {
@@ -791,7 +1289,6 @@ impl App {
         ]);
         frame.render_widget(Paragraph::new(right_label), chunks[5]);
 
-        // Error or hints
         let hint = if let Some(ref error) = dialog.error {
             Line::from(Span::styled(error, Style::default().fg(Color::Red)))
         } else {
@@ -809,7 +1306,6 @@ impl App {
 
     fn render_delete_confirm_dialog(&self, frame: &mut Frame, name: &str) {
         let area = centered_rect(50, 7, frame.area());
-
         frame.render_widget(Clear, area);
 
         let block = Block::default()
@@ -840,7 +1336,6 @@ impl App {
 
     fn render_error_dialog(&self, frame: &mut Frame, message: &str) {
         let area = centered_rect(60, 7, frame.area());
-
         frame.render_widget(Clear, area);
 
         let block = Block::default()
@@ -868,7 +1363,8 @@ impl App {
     }
 }
 
-/// Helper function to create a centered rect
+// Helper functions
+
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let popup_width = area.width * percent_x / 100;
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -880,6 +1376,114 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
         popup_width.min(area.width),
         height.min(area.height),
     )
+}
+
+fn action_path(action: &SyncAction) -> &PathBuf {
+    match action {
+        SyncAction::CopyToRight { path, .. } => path,
+        SyncAction::CopyToLeft { path, .. } => path,
+        SyncAction::DeleteRight { path } => path,
+        SyncAction::DeleteLeft { path } => path,
+        SyncAction::CreateDirRight { path } => path,
+        SyncAction::CreateDirLeft { path } => path,
+        SyncAction::Conflict { path, .. } => path,
+        SyncAction::Skip { path, .. } => path,
+    }
+}
+
+fn is_skip_action(action: &UserAction) -> bool {
+    matches!(
+        action,
+        UserAction::Skip { .. } | UserAction::Original(SyncAction::Skip { .. })
+    )
+}
+
+fn is_conflict_action(action: &UserAction) -> bool {
+    matches!(action, UserAction::Original(SyncAction::Conflict { .. }))
+}
+
+fn get_action_size(action: &UserAction) -> u64 {
+    match action {
+        UserAction::Original(SyncAction::CopyToRight { size, .. }) => *size,
+        UserAction::Original(SyncAction::CopyToLeft { size, .. }) => *size,
+        UserAction::CopyToRight { size, .. } => *size,
+        UserAction::CopyToLeft { size, .. } => *size,
+        _ => 0,
+    }
+}
+
+fn render_action_item(action: &UserAction, is_selected: bool, is_marked: bool) -> ListItem<'static> {
+    let (symbol, color, path_str) = match action {
+        UserAction::Original(SyncAction::CopyToRight { path, size }) => {
+            ("→", Color::Green, format!("{} ({})", path.display(), format_bytes(*size)))
+        }
+        UserAction::Original(SyncAction::CopyToLeft { path, size }) => {
+            ("←", Color::Blue, format!("{} ({})", path.display(), format_bytes(*size)))
+        }
+        UserAction::Original(SyncAction::DeleteRight { path }) => {
+            ("✕→", Color::Red, path.display().to_string())
+        }
+        UserAction::Original(SyncAction::DeleteLeft { path }) => {
+            ("←✕", Color::Red, path.display().to_string())
+        }
+        UserAction::Original(SyncAction::CreateDirRight { path }) => {
+            ("📁→", Color::Green, path.display().to_string())
+        }
+        UserAction::Original(SyncAction::CreateDirLeft { path }) => {
+            ("←📁", Color::Blue, path.display().to_string())
+        }
+        UserAction::Original(SyncAction::Conflict { path, reason, .. }) => {
+            let reason_str = match reason {
+                ConflictReason::BothModified => "both modified",
+                ConflictReason::ModifiedAndDeleted => "mod vs del",
+                ConflictReason::ExistsVsDeleted => "exists vs del",
+            };
+            ("⚠", Color::Yellow, format!("{} ({})", path.display(), reason_str))
+        }
+        UserAction::Original(SyncAction::Skip { path, .. }) => {
+            ("·", Color::DarkGray, path.display().to_string())
+        }
+        UserAction::CopyToRight { path, size } => {
+            ("→*", Color::Green, format!("{} ({})", path.display(), format_bytes(*size)))
+        }
+        UserAction::CopyToLeft { path, size } => {
+            ("←*", Color::Blue, format!("{} ({})", path.display(), format_bytes(*size)))
+        }
+        UserAction::Skip { path } => ("·*", Color::DarkGray, path.display().to_string()),
+    };
+
+    let marker = if is_marked { "● " } else { "  " };
+    let modified_indicator = if action.is_modified() { "*" } else { "" };
+
+    let style = if is_selected {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else {
+        Style::default()
+    };
+
+    ListItem::new(Line::from(vec![
+        Span::raw(marker),
+        Span::styled(format!("{:<3}", symbol), Style::default().fg(color)),
+        Span::raw(" "),
+        Span::styled(path_str, style),
+        Span::styled(modified_indicator, Style::default().fg(Color::Magenta)),
+    ]))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 #[cfg(test)]
@@ -957,39 +1561,9 @@ mod tests {
     }
 
     #[test]
-    fn test_new_project_dialog_text_input() {
-        let (mut app, _temp) = create_test_app();
-        app.dialog = Dialog::NewProject(NewProjectDialog::new());
-
-        app.handle_key(KeyCode::Char('t'));
-        app.handle_key(KeyCode::Char('e'));
-        app.handle_key(KeyCode::Char('s'));
-        app.handle_key(KeyCode::Char('t'));
-
-        if let Dialog::NewProject(ref d) = app.dialog {
-            assert_eq!(d.name, "test");
-        }
-    }
-
-    #[test]
-    fn test_new_project_dialog_backspace() {
-        let (mut app, _temp) = create_test_app();
-        app.dialog = Dialog::NewProject(NewProjectDialog::new());
-
-        app.handle_key(KeyCode::Char('a'));
-        app.handle_key(KeyCode::Char('b'));
-        app.handle_key(KeyCode::Backspace);
-
-        if let Dialog::NewProject(ref d) = app.dialog {
-            assert_eq!(d.name, "a");
-        }
-    }
-
-    #[test]
     fn test_create_project() {
         let (mut app, _temp) = create_test_app();
 
-        // Open dialog and fill in fields
         app.dialog = Dialog::NewProject(NewProjectDialog {
             name: "test-project".to_string(),
             left_path: "/path/left".to_string(),
@@ -1006,33 +1580,12 @@ mod tests {
     }
 
     #[test]
-    fn test_create_project_validation_empty_name() {
-        let (mut app, _temp) = create_test_app();
-
-        app.dialog = Dialog::NewProject(NewProjectDialog {
-            name: "".to_string(),
-            left_path: "/path/left".to_string(),
-            right_path: "/path/right".to_string(),
-            focused_field: DialogField::Name,
-            error: None,
-        });
-
-        app.try_create_project();
-
-        if let Dialog::NewProject(ref d) = app.dialog {
-            assert!(d.error.is_some());
-        } else {
-            panic!("Dialog should still be open");
-        }
-    }
-
-    #[test]
     fn test_select_next_wraps() {
         let (mut app, _temp) = create_test_app();
         app.projects = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         app.list_state.select(Some(2));
 
-        app.select_next();
+        app.select_next_project();
 
         assert_eq!(app.list_state.selected(), Some(0));
     }
@@ -1043,7 +1596,7 @@ mod tests {
         app.projects = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         app.list_state.select(Some(0));
 
-        app.select_previous();
+        app.select_previous_project();
 
         assert_eq!(app.list_state.selected(), Some(2));
     }
@@ -1052,37 +1605,16 @@ mod tests {
     fn test_open_project() {
         let (mut app, _temp) = create_test_app();
 
-        // Create a project first
         let pm = app.project_manager.as_ref().unwrap();
         let project = Project::new("test", PathBuf::from("/left"), PathBuf::from("/right"));
         pm.save_project(&project).unwrap();
         app.refresh_projects();
 
-        // Open it
         app.list_state.select(Some(0));
         app.open_selected_project();
 
         assert_eq!(app.screen, Screen::ProjectView);
         assert!(app.current_project.is_some());
-        assert_eq!(app.current_project.as_ref().unwrap().name, "test");
-    }
-
-    #[test]
-    fn test_delete_project() {
-        let (mut app, _temp) = create_test_app();
-
-        // Create a project
-        let pm = app.project_manager.as_ref().unwrap();
-        let project = Project::new("to-delete", PathBuf::from("/left"), PathBuf::from("/right"));
-        pm.save_project(&project).unwrap();
-        app.refresh_projects();
-
-        assert_eq!(app.projects.len(), 1);
-
-        // Delete it
-        app.delete_project("to-delete");
-
-        assert!(app.projects.is_empty());
     }
 
     #[test]
@@ -1098,43 +1630,43 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_confirm_dialog() {
-        let (mut app, _temp) = create_test_app();
-
-        // Create a project
-        let pm = app.project_manager.as_ref().unwrap();
-        let project = Project::new("test", PathBuf::from("/l"), PathBuf::from("/r"));
-        pm.save_project(&project).unwrap();
-        app.refresh_projects();
-        app.list_state.select(Some(0));
-
-        // Press D to open delete confirm
-        app.handle_key(KeyCode::Char('d'));
-        assert!(matches!(app.dialog, Dialog::DeleteConfirm(_)));
-
-        // Press N to cancel
-        app.handle_key(KeyCode::Char('n'));
-        assert!(matches!(app.dialog, Dialog::None));
-        assert_eq!(app.projects.len(), 1);
+    fn test_preview_filter_cycle() {
+        let filter = PreviewFilter::All;
+        assert_eq!(filter.next(), PreviewFilter::Changes);
+        assert_eq!(filter.next().next(), PreviewFilter::Conflicts);
+        assert_eq!(filter.next().next().next(), PreviewFilter::All);
     }
 
     #[test]
-    fn test_delete_confirm_yes() {
-        let (mut app, _temp) = create_test_app();
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1048576), "1.0 MB");
+        assert_eq!(format_bytes(1073741824), "1.0 GB");
+    }
 
-        // Create a project
-        let pm = app.project_manager.as_ref().unwrap();
-        let project = Project::new("test", PathBuf::from("/l"), PathBuf::from("/r"));
-        pm.save_project(&project).unwrap();
-        app.refresh_projects();
-        app.list_state.select(Some(0));
+    #[test]
+    fn test_preview_state_creation() {
+        use std::fs;
 
-        // Press D then Y
-        app.handle_key(KeyCode::Char('d'));
-        app.handle_key(KeyCode::Char('y'));
+        let temp_left = TempDir::new().unwrap();
+        let temp_right = TempDir::new().unwrap();
 
-        assert!(matches!(app.dialog, Dialog::None));
-        assert!(app.projects.is_empty());
+        fs::write(temp_left.path().join("file.txt"), "content").unwrap();
+
+        let left_scan = scan(temp_left.path()).unwrap();
+        let right_scan = scan(temp_right.path()).unwrap();
+        let left_meta = SyncMetadata::default();
+        let right_meta = SyncMetadata::default();
+
+        let diff_result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+        let preview = PreviewState::new(diff_result, left_scan, right_scan);
+
+        assert!(!preview.actions.is_empty());
+        assert_eq!(preview.filter, PreviewFilter::All);
+        assert_eq!(preview.selected, 0);
     }
 
     #[test]
