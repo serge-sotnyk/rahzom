@@ -27,6 +27,16 @@
 
 ---
 
+## Versioning Convention
+
+At the end of each stage, increment the **MINOR** version in `Cargo.toml`:
+- Stage 0 → `0.1.0`
+- Stage 1 → `0.2.0`
+- Stage 2 → `0.3.0`
+- ... and so on until release `1.0.0`
+
+---
+
 ## Stage 0: Project Setup
 
 **Goal**: Working Rust project with tests infrastructure and test data generator.
