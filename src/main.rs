@@ -3,9 +3,7 @@ use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use std::io;
 
-mod app;
-
-use app::App;
+use rahzom::app::App;
 
 fn main() -> Result<()> {
     // Initialize terminal with panic hook
