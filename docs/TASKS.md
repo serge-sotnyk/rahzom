@@ -595,6 +595,38 @@ pub struct App {
 
 ---
 
+## Stage 8.a: Handle Missing Directories (fix)
+
+**Goal**: When user runs Analyze, handle non-existent paths gracefully.
+
+### Problem
+Scanner fails with "Failed to canonicalize path" when directory doesn't exist instead of offering to create it.
+
+### Tasks
+
+#### 8.a.1 Check paths before analyze
+- Before calling `scan()`, check if both paths exist
+- If both missing → show error "At least one directory must exist"
+- If one missing → show dialog "Directory X doesn't exist. Create it? [Y/N]"
+
+#### 8.a.2 Add CreateDirConfirm dialog
+- Y/Enter: create directory with `fs::create_dir_all()`, then re-run analyze
+- N/Esc: close dialog, return to ProjectView
+
+#### 8.a.3 Tests
+- Both paths missing → error dialog
+- Left path missing → create confirm dialog
+- Right path missing → create confirm dialog
+- Create on confirm → analyze runs
+
+### Definition of Done
+- [x] Both missing → error message
+- [x] One missing → offer to create
+- [x] After creation → analyze runs automatically
+- [x] Tests pass
+
+---
+
 ## Stage 9: TUI Sync Execution
 
 **Goal**: Execute sync with progress display.

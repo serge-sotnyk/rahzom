@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::project::{Project, ProjectManager};
@@ -32,6 +32,7 @@ pub enum Dialog {
     None,
     NewProject(NewProjectDialog),
     DeleteConfirm(String),
+    CreateDirConfirm { path: PathBuf, is_left: bool },
     Error(String),
 }
 
@@ -373,6 +374,7 @@ impl App {
             Dialog::None => self.handle_key_normal(code),
             Dialog::NewProject(_) => self.handle_key_new_project(code),
             Dialog::DeleteConfirm(_) => self.handle_key_delete_confirm(code),
+            Dialog::CreateDirConfirm { .. } => self.handle_key_create_dir_confirm(code),
             Dialog::Error(_) => self.handle_key_error(code),
         }
     }
@@ -533,6 +535,30 @@ impl App {
                     self.delete_project(&name);
                 }
                 self.dialog = Dialog::None;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.dialog = Dialog::None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_create_dir_confirm(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Dialog::CreateDirConfirm { ref path, .. } = self.dialog {
+                    let path = path.clone();
+                    match std::fs::create_dir_all(&path) {
+                        Ok(()) => {
+                            self.dialog = Dialog::None;
+                            self.run_analyze();
+                        }
+                        Err(e) => {
+                            self.dialog =
+                                Dialog::Error(format!("Failed to create directory: {}", e));
+                        }
+                    }
+                }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.dialog = Dialog::None;
@@ -783,6 +809,33 @@ impl App {
             return;
         };
 
+        // Check if paths exist
+        let left_exists = project.left_path.exists();
+        let right_exists = project.right_path.exists();
+
+        if !left_exists && !right_exists {
+            self.dialog = Dialog::Error(
+                "At least one directory must exist. Both paths are missing.".to_string(),
+            );
+            return;
+        }
+
+        if !left_exists {
+            self.dialog = Dialog::CreateDirConfirm {
+                path: project.left_path.clone(),
+                is_left: true,
+            };
+            return;
+        }
+
+        if !right_exists {
+            self.dialog = Dialog::CreateDirConfirm {
+                path: project.right_path.clone(),
+                is_left: false,
+            };
+            return;
+        }
+
         // Scan both sides
         let left_scan = match scan(&project.left_path) {
             Ok(s) => s,
@@ -890,6 +943,9 @@ impl App {
             }
             Dialog::DeleteConfirm(name) => {
                 self.render_delete_confirm_dialog(frame, name);
+            }
+            Dialog::CreateDirConfirm { path, is_left } => {
+                self.render_create_dir_confirm_dialog(frame, path, *is_left);
             }
             Dialog::Error(msg) => {
                 self.render_error_dialog(frame, msg);
@@ -1334,6 +1390,43 @@ impl App {
         );
     }
 
+    fn render_create_dir_confirm_dialog(&self, frame: &mut Frame, path: &Path, is_left: bool) {
+        let area = centered_rect(70, 9, frame.area());
+        frame.render_widget(Clear, area);
+
+        let block = Block::default()
+            .title(" Create Directory ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let side = if is_left { "Left" } else { "Right" };
+        let text = vec![
+            Line::from(""),
+            Line::from(format!("{} directory doesn't exist:", side)),
+            Line::from(Span::styled(
+                path.display().to_string(),
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(""),
+            Line::from("Create it?"),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" Y ", Style::default().fg(Color::Black).bg(Color::Green)),
+                Span::raw(" Yes  "),
+                Span::styled(" N ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" No"),
+            ]),
+        ];
+
+        frame.render_widget(
+            Paragraph::new(text).alignment(ratatui::layout::Alignment::Center),
+            inner,
+        );
+    }
+
     fn render_error_dialog(&self, frame: &mut Frame, message: &str) {
         let area = centered_rect(60, 7, frame.area());
         frame.render_widget(Clear, area);
@@ -1678,5 +1771,110 @@ mod tests {
         assert_eq!(centered.height, 10);
         assert_eq!(centered.x, 25);
         assert_eq!(centered.y, 20);
+    }
+
+    #[test]
+    fn test_analyze_both_paths_missing_shows_error() {
+        let (mut app, _temp) = create_test_app();
+        app.screen = Screen::ProjectView;
+        app.current_project = Some(Project::new(
+            "test",
+            PathBuf::from("/nonexistent/left"),
+            PathBuf::from("/nonexistent/right"),
+        ));
+
+        app.run_analyze();
+
+        match &app.dialog {
+            Dialog::Error(msg) => {
+                assert!(msg.contains("At least one directory must exist"));
+            }
+            _ => panic!("Expected Error dialog"),
+        }
+    }
+
+    #[test]
+    fn test_analyze_left_missing_shows_create_dialog() {
+        let (mut app, _temp) = create_test_app();
+        let temp_right = TempDir::new().unwrap();
+
+        app.screen = Screen::ProjectView;
+        app.current_project = Some(Project::new(
+            "test",
+            PathBuf::from("/nonexistent/left"),
+            temp_right.path().to_path_buf(),
+        ));
+
+        app.run_analyze();
+
+        match &app.dialog {
+            Dialog::CreateDirConfirm { path, is_left } => {
+                assert_eq!(path, &PathBuf::from("/nonexistent/left"));
+                assert!(*is_left);
+            }
+            _ => panic!("Expected CreateDirConfirm dialog"),
+        }
+    }
+
+    #[test]
+    fn test_analyze_right_missing_shows_create_dialog() {
+        let (mut app, _temp) = create_test_app();
+        let temp_left = TempDir::new().unwrap();
+
+        app.screen = Screen::ProjectView;
+        app.current_project = Some(Project::new(
+            "test",
+            temp_left.path().to_path_buf(),
+            PathBuf::from("/nonexistent/right"),
+        ));
+
+        app.run_analyze();
+
+        match &app.dialog {
+            Dialog::CreateDirConfirm { path, is_left } => {
+                assert_eq!(path, &PathBuf::from("/nonexistent/right"));
+                assert!(!*is_left);
+            }
+            _ => panic!("Expected CreateDirConfirm dialog"),
+        }
+    }
+
+    #[test]
+    fn test_create_dir_on_confirm() {
+        let (mut app, _temp) = create_test_app();
+        let temp_left = TempDir::new().unwrap();
+        let right_path = temp_left.path().join("new_dir");
+
+        app.screen = Screen::ProjectView;
+        app.current_project = Some(Project::new(
+            "test",
+            temp_left.path().to_path_buf(),
+            right_path.clone(),
+        ));
+
+        app.dialog = Dialog::CreateDirConfirm {
+            path: right_path.clone(),
+            is_left: false,
+        };
+
+        app.handle_key(KeyCode::Char('y'));
+
+        assert!(right_path.exists());
+        // After creation, analyze runs and we should be in Preview or have scanned
+        assert!(matches!(app.dialog, Dialog::None) || matches!(app.screen, Screen::Preview));
+    }
+
+    #[test]
+    fn test_create_dir_cancel() {
+        let (mut app, _temp) = create_test_app();
+
+        app.dialog = Dialog::CreateDirConfirm {
+            path: PathBuf::from("/some/path"),
+            is_left: true,
+        };
+
+        app.handle_key(KeyCode::Char('n'));
+
+        assert!(matches!(app.dialog, Dialog::None));
     }
 }
