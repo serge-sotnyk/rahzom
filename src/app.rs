@@ -4,17 +4,22 @@ use ratatui::{
     layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::project::{Project, ProjectManager};
 use crate::sync::differ::{diff, ConflictReason, DiffResult, SyncAction};
-use crate::sync::metadata::SyncMetadata;
+use crate::sync::executor::{
+    CompletedAction, ExecutionResult, Executor, ExecutorConfig, FailedAction, FileSnapshot,
+    NoopProgress, SkippedAction,
+};
+use crate::sync::metadata::{DeletedFile, FileAttributes, FileState, SyncMetadata};
 use crate::sync::scanner::{scan, ScanResult};
+use chrono::Utc;
 
 /// Application screens
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,16 +29,19 @@ pub enum Screen {
     Analyzing,
     Preview,
     Syncing,
+    SyncComplete,
 }
 
 /// Dialog mode for project list screen
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Dialog {
     None,
     NewProject(NewProjectDialog),
     DeleteConfirm(String),
     CreateDirConfirm { path: PathBuf, is_left: bool },
     Error(String),
+    SyncConfirm(SyncConfirmDialog),
+    CancelSyncConfirm,
 }
 
 /// Filter mode for preview
@@ -88,6 +96,30 @@ impl UserAction {
 
     fn is_modified(&self) -> bool {
         !matches!(self, Self::Original(_))
+    }
+
+    /// Converts UserAction to SyncAction for execution.
+    /// Returns None for Skip and Conflict actions.
+    fn to_sync_action(&self) -> Option<SyncAction> {
+        match self {
+            UserAction::Original(action) => match action {
+                SyncAction::Skip { .. } | SyncAction::Conflict { .. } => None,
+                _ => Some(action.clone()),
+            },
+            UserAction::CopyToRight { path, size } => {
+                Some(SyncAction::CopyToRight {
+                    path: path.clone(),
+                    size: *size,
+                })
+            }
+            UserAction::CopyToLeft { path, size } => {
+                Some(SyncAction::CopyToLeft {
+                    path: path.clone(),
+                    size: *size,
+                })
+            }
+            UserAction::Skip { .. } => None,
+        }
     }
 }
 
@@ -184,6 +216,62 @@ struct PreviewSummary {
     skipped: usize,
 }
 
+/// Sync confirmation dialog data
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyncConfirmDialog {
+    pub files_to_copy: usize,
+    pub files_to_delete: usize,
+    pub bytes_to_transfer: u64,
+    pub dirs_to_create: usize,
+}
+
+/// State during sync execution
+#[derive(Debug)]
+pub struct SyncingState {
+    pub total_actions: usize,
+    pub completed_actions: usize,
+    pub total_bytes: u64,
+    pub transferred_bytes: u64,
+    pub current_file: PathBuf,
+    pub start_time: Instant,
+    pub cancel_requested: bool,
+    pub current_index: usize,
+    pub actions: Vec<SyncAction>,
+    pub snapshots: HashMap<PathBuf, FileSnapshot>,
+    pub result: ExecutionResult,
+}
+
+impl SyncingState {
+    fn elapsed(&self) -> Duration {
+        self.start_time.elapsed()
+    }
+
+    fn estimated_remaining(&self) -> Option<Duration> {
+        if self.completed_actions == 0 {
+            return None;
+        }
+        let elapsed = self.elapsed();
+        let rate = self.completed_actions as f64 / elapsed.as_secs_f64();
+        if rate <= 0.0 {
+            return None;
+        }
+        let remaining = self.total_actions - self.completed_actions;
+        Some(Duration::from_secs_f64(remaining as f64 / rate))
+    }
+}
+
+/// State after sync completion
+#[derive(Debug)]
+pub struct SyncCompleteState {
+    pub completed: Vec<CompletedAction>,
+    pub failed: Vec<FailedAction>,
+    pub skipped: Vec<SkippedAction>,
+    pub duration: Duration,
+    pub bytes_transferred: u64,
+    pub scroll_offset: usize,
+    pub changed_during_sync: Vec<PathBuf>,
+}
+
 /// New project dialog state
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewProjectDialog {
@@ -255,6 +343,12 @@ pub struct App {
     // Preview state
     pub preview: Option<PreviewState>,
 
+    // Syncing state
+    pub syncing: Option<SyncingState>,
+
+    // Sync complete state
+    pub sync_complete: Option<SyncCompleteState>,
+
     // Mouse tracking
     last_click: Option<(u16, u16, Instant)>,
     content_area: Option<Rect>,
@@ -277,6 +371,8 @@ impl App {
             project_manager: None,
             current_project: None,
             preview: None,
+            syncing: None,
+            sync_complete: None,
             last_click: None,
             content_area: None,
         };
@@ -317,6 +413,8 @@ impl App {
             project_manager: Some(pm),
             current_project: None,
             preview: None,
+            syncing: None,
+            sync_complete: None,
             last_click: None,
             content_area: None,
         }
@@ -346,6 +444,12 @@ impl App {
     pub fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
+
+            // If syncing and no dialog, execute one action per frame
+            if self.screen == Screen::Syncing && matches!(self.dialog, Dialog::None) {
+                self.execute_next_sync_action();
+            }
+
             self.handle_events()?;
         }
         Ok(())
@@ -353,7 +457,14 @@ impl App {
 
     /// Handle input events
     fn handle_events(&mut self) -> Result<()> {
-        if event::poll(Duration::from_millis(100))? {
+        // Use shorter poll timeout during sync for responsiveness
+        let poll_timeout = if self.screen == Screen::Syncing {
+            Duration::from_millis(10)
+        } else {
+            Duration::from_millis(100)
+        };
+
+        if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     self.handle_key(key.code);
@@ -376,6 +487,8 @@ impl App {
             Dialog::DeleteConfirm(_) => self.handle_key_delete_confirm(code),
             Dialog::CreateDirConfirm { .. } => self.handle_key_create_dir_confirm(code),
             Dialog::Error(_) => self.handle_key_error(code),
+            Dialog::SyncConfirm(_) => self.handle_key_sync_confirm(code),
+            Dialog::CancelSyncConfirm => self.handle_key_cancel_sync_confirm(code),
         }
     }
 
@@ -384,6 +497,8 @@ impl App {
             Screen::ProjectList => self.handle_key_project_list(code),
             Screen::ProjectView => self.handle_key_project_view(code),
             Screen::Preview => self.handle_key_preview(code),
+            Screen::Syncing => self.handle_key_syncing(code),
+            Screen::SyncComplete => self.handle_key_sync_complete(code),
             _ => {}
         }
     }
@@ -474,6 +589,9 @@ impl App {
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.reset_selected_action();
+            }
+            KeyCode::Char('g') | KeyCode::Char('G') => {
+                self.show_sync_confirmation();
             }
             KeyCode::Char(' ') => {
                 self.toggle_selection();
@@ -571,6 +689,73 @@ impl App {
         match code {
             KeyCode::Enter | KeyCode::Esc => {
                 self.dialog = Dialog::None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_sync_confirm(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => {
+                self.dialog = Dialog::None;
+                self.start_sync();
+            }
+            KeyCode::Esc => {
+                self.dialog = Dialog::None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_cancel_sync_confirm(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(ref mut syncing) = self.syncing {
+                    syncing.cancel_requested = true;
+                }
+                self.dialog = Dialog::None;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.dialog = Dialog::None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_syncing(&mut self, code: KeyCode) {
+        if code == KeyCode::Esc {
+            self.dialog = Dialog::CancelSyncConfirm;
+        }
+    }
+
+    fn handle_key_sync_complete(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter | KeyCode::Esc => {
+                self.sync_complete = None;
+                self.screen = Screen::ProjectView;
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if let Some(ref complete) = self.sync_complete {
+                    if !complete.changed_during_sync.is_empty() {
+                        self.sync_complete = None;
+                        self.run_analyze();
+                    }
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(ref mut complete) = self.sync_complete {
+                    if complete.scroll_offset > 0 {
+                        complete.scroll_offset -= 1;
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(ref mut complete) = self.sync_complete {
+                    let max_scroll = complete.failed.len().saturating_sub(1);
+                    if complete.scroll_offset < max_scroll {
+                        complete.scroll_offset += 1;
+                    }
+                }
             }
             _ => {}
         }
@@ -865,6 +1050,290 @@ impl App {
         self.screen = Screen::Preview;
     }
 
+    fn show_sync_confirmation(&mut self) {
+        let Some(ref preview) = self.preview else {
+            return;
+        };
+
+        let summary = preview.summary();
+
+        // Check if there's anything to sync
+        let total_operations = summary.copy_to_right
+            + summary.copy_to_left
+            + summary.delete_right
+            + summary.delete_left
+            + summary.dirs_to_create;
+
+        if total_operations == 0 {
+            self.dialog = Dialog::Error("Nothing to sync - all items are skipped".to_string());
+            return;
+        }
+
+        self.dialog = Dialog::SyncConfirm(SyncConfirmDialog {
+            files_to_copy: summary.copy_to_right + summary.copy_to_left,
+            files_to_delete: summary.delete_right + summary.delete_left,
+            bytes_to_transfer: summary.bytes_to_right + summary.bytes_to_left,
+            dirs_to_create: summary.dirs_to_create,
+        });
+    }
+
+    fn start_sync(&mut self) {
+        let Some(ref preview) = self.preview else {
+            return;
+        };
+        let Some(ref project) = self.current_project else {
+            return;
+        };
+
+        // Convert UserActions to SyncActions, filtering out Skip/Conflict
+        let actions: Vec<SyncAction> = preview
+            .actions
+            .iter()
+            .filter_map(|ua| ua.to_sync_action())
+            .collect();
+
+        if actions.is_empty() {
+            self.dialog = Dialog::Error("No actions to execute".to_string());
+            return;
+        }
+
+        // Build snapshots from scan results for file verification
+        let mut snapshots = HashMap::new();
+        if let Some(ref left_scan) = preview.left_scan {
+            for entry in &left_scan.entries {
+                if !entry.is_dir {
+                    snapshots.insert(
+                        project.left_path.join(&entry.path),
+                        FileSnapshot {
+                            size: entry.size,
+                            mtime: entry.mtime,
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(ref right_scan) = preview.right_scan {
+            for entry in &right_scan.entries {
+                if !entry.is_dir {
+                    snapshots.insert(
+                        project.right_path.join(&entry.path),
+                        FileSnapshot {
+                            size: entry.size,
+                            mtime: entry.mtime,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Calculate total bytes
+        let total_bytes: u64 = actions
+            .iter()
+            .map(|a| match a {
+                SyncAction::CopyToRight { size, .. } | SyncAction::CopyToLeft { size, .. } => *size,
+                _ => 0,
+            })
+            .sum();
+
+        self.syncing = Some(SyncingState {
+            total_actions: actions.len(),
+            completed_actions: 0,
+            total_bytes,
+            transferred_bytes: 0,
+            current_file: PathBuf::new(),
+            start_time: Instant::now(),
+            cancel_requested: false,
+            current_index: 0,
+            actions,
+            snapshots,
+            result: ExecutionResult::default(),
+        });
+
+        self.dialog = Dialog::None;
+        self.screen = Screen::Syncing;
+    }
+
+    fn execute_next_sync_action(&mut self) {
+        let Some(ref project) = self.current_project else {
+            return;
+        };
+        let Some(ref mut syncing) = self.syncing else {
+            return;
+        };
+
+        // Check if cancelled
+        if syncing.cancel_requested {
+            self.finish_sync(true);
+            return;
+        }
+
+        // Check if done
+        if syncing.current_index >= syncing.actions.len() {
+            self.finish_sync(false);
+            return;
+        }
+
+        let action = syncing.actions[syncing.current_index].clone();
+
+        // Update current file display
+        syncing.current_file = match &action {
+            SyncAction::CopyToRight { path, .. }
+            | SyncAction::CopyToLeft { path, .. }
+            | SyncAction::DeleteRight { path }
+            | SyncAction::DeleteLeft { path }
+            | SyncAction::CreateDirRight { path }
+            | SyncAction::CreateDirLeft { path }
+            | SyncAction::Skip { path, .. }
+            | SyncAction::Conflict { path, .. } => path.clone(),
+        };
+
+        // Create executor for this action
+        let executor = Executor::new(
+            project.left_path.clone(),
+            project.right_path.clone(),
+            ExecutorConfig::default(),
+        );
+
+        // Execute single action
+        let single_action = vec![action.clone()];
+        match executor.execute(single_action, &syncing.snapshots, &mut NoopProgress) {
+            Ok(result) => {
+                // Update progress (must be done before moving fields)
+                syncing.transferred_bytes += result.total_bytes_transferred();
+
+                // Accumulate results
+                syncing.result.completed.extend(result.completed);
+                syncing.result.failed.extend(result.failed);
+                syncing.result.skipped.extend(result.skipped);
+            }
+            Err(e) => {
+                syncing.result.failed.push(FailedAction {
+                    action,
+                    error: e.to_string(),
+                });
+            }
+        }
+
+        syncing.completed_actions += 1;
+        syncing.current_index += 1;
+    }
+
+    fn finish_sync(&mut self, cancelled: bool) {
+        let Some(syncing) = self.syncing.take() else {
+            return;
+        };
+
+        // Calculate values before moving
+        let duration = syncing.elapsed();
+        let bytes_transferred = syncing.transferred_bytes;
+
+        // Collect changed files from skipped actions
+        let changed_during_sync: Vec<PathBuf> = syncing
+            .result
+            .skipped
+            .iter()
+            .filter(|s| s.reason.contains("changed"))
+            .filter_map(|s| match &s.action {
+                SyncAction::CopyToRight { path, .. } | SyncAction::CopyToLeft { path, .. } => {
+                    Some(path.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Update metadata if sync was successful (not cancelled)
+        if !cancelled {
+            if let Err(e) = self.save_sync_metadata(&syncing.result) {
+                // Log error but don't fail
+                eprintln!("Failed to save metadata: {}", e);
+            }
+        }
+
+        self.sync_complete = Some(SyncCompleteState {
+            completed: syncing.result.completed,
+            failed: syncing.result.failed,
+            skipped: syncing.result.skipped,
+            duration,
+            bytes_transferred,
+            scroll_offset: 0,
+            changed_during_sync,
+        });
+
+        self.preview = None;
+        self.screen = Screen::SyncComplete;
+    }
+
+    fn save_sync_metadata(&self, result: &ExecutionResult) -> Result<()> {
+        let Some(ref project) = self.current_project else {
+            return Ok(());
+        };
+
+        // Load existing metadata
+        let mut left_meta = SyncMetadata::load(&project.left_path).unwrap_or_default();
+        let mut right_meta = SyncMetadata::load(&project.right_path).unwrap_or_default();
+
+        let now = Utc::now();
+
+        // Update metadata based on completed actions
+        for completed in &result.completed {
+            match &completed.action {
+                SyncAction::CopyToRight { path, size } => {
+                    let file_state = FileState {
+                        path: path.to_string_lossy().to_string(),
+                        size: *size,
+                        mtime: now,
+                        hash: None,
+                        attributes: FileAttributes::default(),
+                        last_synced: now,
+                    };
+                    left_meta.upsert_file(file_state.clone());
+                    right_meta.upsert_file(file_state);
+                }
+                SyncAction::CopyToLeft { path, size } => {
+                    let file_state = FileState {
+                        path: path.to_string_lossy().to_string(),
+                        size: *size,
+                        mtime: now,
+                        hash: None,
+                        attributes: FileAttributes::default(),
+                        last_synced: now,
+                    };
+                    left_meta.upsert_file(file_state.clone());
+                    right_meta.upsert_file(file_state);
+                }
+                SyncAction::DeleteRight { path } => {
+                    let path_str = path.to_string_lossy().to_string();
+                    right_meta.mark_deleted(DeletedFile {
+                        path: path_str,
+                        size: 0,
+                        mtime: now,
+                        hash: None,
+                        deleted_at: now,
+                    });
+                }
+                SyncAction::DeleteLeft { path } => {
+                    let path_str = path.to_string_lossy().to_string();
+                    left_meta.mark_deleted(DeletedFile {
+                        path: path_str,
+                        size: 0,
+                        mtime: now,
+                        hash: None,
+                        deleted_at: now,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        left_meta.last_sync = Some(now);
+        right_meta.last_sync = Some(now);
+
+        left_meta.save(&project.left_path)?;
+        right_meta.save(&project.right_path)?;
+
+        Ok(())
+    }
+
     fn try_create_project(&mut self) {
         if let Dialog::NewProject(ref dialog) = self.dialog {
             if dialog.name.is_empty() {
@@ -950,6 +1419,12 @@ impl App {
             Dialog::Error(msg) => {
                 self.render_error_dialog(frame, msg);
             }
+            Dialog::SyncConfirm(dialog) => {
+                self.render_sync_confirm_dialog(frame, dialog);
+            }
+            Dialog::CancelSyncConfirm => {
+                self.render_cancel_sync_confirm_dialog(frame);
+            }
         }
     }
 
@@ -975,6 +1450,7 @@ impl App {
                 }
             }
             Screen::Syncing => "Syncing...".to_string(),
+            Screen::SyncComplete => "Sync Complete".to_string(),
         };
 
         let header = Paragraph::new(Line::from(vec![
@@ -1003,6 +1479,8 @@ impl App {
             Screen::ProjectList => self.render_project_list(frame, area),
             Screen::ProjectView => self.render_project_view(frame, area),
             Screen::Preview => self.render_preview(frame, area),
+            Screen::Syncing => self.render_syncing(frame, area),
+            Screen::SyncComplete => self.render_sync_complete(frame, area),
             _ => {}
         }
     }
@@ -1251,11 +1729,40 @@ impl App {
                     Span::raw(" Dir  "),
                     Span::styled(" S ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     Span::raw(" Skip  "),
+                    Span::styled(" G ", Style::default().fg(Color::Black).bg(Color::Green)),
+                    Span::raw(" Go/Sync  "),
                     Span::styled(" F ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     Span::raw(" Filter  "),
                     Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     Span::raw(" Back "),
                 ]
+            }
+            Screen::Syncing => {
+                vec![
+                    Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Red)),
+                    Span::raw(" Cancel "),
+                ]
+            }
+            Screen::SyncComplete => {
+                let mut hints = vec![
+                    Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" Back  "),
+                ];
+                if let Some(ref complete) = self.sync_complete {
+                    if !complete.changed_during_sync.is_empty() {
+                        hints.extend(vec![
+                            Span::styled(" R ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+                            Span::raw(" Re-analyze  "),
+                        ]);
+                    }
+                    if !complete.failed.is_empty() {
+                        hints.extend(vec![
+                            Span::styled(" ↑↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                            Span::raw(" Scroll "),
+                        ]);
+                    }
+                }
+                hints
             }
             _ => vec![
                 Span::styled(" Q ", Style::default().fg(Color::Black).bg(Color::Gray)),
@@ -1454,6 +1961,274 @@ impl App {
             inner,
         );
     }
+
+    fn render_sync_confirm_dialog(&self, frame: &mut Frame, dialog: &SyncConfirmDialog) {
+        let area = centered_rect(60, 11, frame.area());
+        frame.render_widget(Clear, area);
+
+        let block = Block::default()
+            .title(" Confirm Sync ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Green));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let text = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Copy: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} files", dialog.files_to_copy),
+                    Style::default().fg(Color::Green),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Delete: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} files", dialog.files_to_delete),
+                    Style::default().fg(Color::Red),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Transfer: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format_bytes(dialog.bytes_to_transfer)),
+            ]),
+            Line::from(vec![
+                Span::styled("Create dirs: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", dialog.dirs_to_create)),
+            ]),
+            Line::from(""),
+            Line::from("Start synchronization?"),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Green)),
+                Span::raw(" Start  "),
+                Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" Cancel"),
+            ]),
+        ];
+
+        frame.render_widget(
+            Paragraph::new(text).alignment(ratatui::layout::Alignment::Center),
+            inner,
+        );
+    }
+
+    fn render_cancel_sync_confirm_dialog(&self, frame: &mut Frame) {
+        let area = centered_rect(50, 7, frame.area());
+        frame.render_widget(Clear, area);
+
+        let block = Block::default()
+            .title(" Cancel Sync? ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let text = vec![
+            Line::from(""),
+            Line::from("Cancel synchronization?"),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" Y ", Style::default().fg(Color::Black).bg(Color::Red)),
+                Span::raw(" Yes  "),
+                Span::styled(" N ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" No"),
+            ]),
+        ];
+
+        frame.render_widget(
+            Paragraph::new(text).alignment(ratatui::layout::Alignment::Center),
+            inner,
+        );
+    }
+
+    fn render_syncing(&self, frame: &mut Frame, area: Rect) {
+        let Some(ref syncing) = self.syncing else {
+            return;
+        };
+
+        let chunks = Layout::vertical([
+            Constraint::Length(3), // Files progress
+            Constraint::Length(3), // Bytes progress
+            Constraint::Length(2), // Current file
+            Constraint::Length(2), // Time info
+            Constraint::Min(1),    // Spacer
+        ])
+        .split(area);
+
+        // Files progress bar
+        let files_progress =
+            syncing.completed_actions as f64 / syncing.total_actions.max(1) as f64;
+        let files_gauge = Gauge::default()
+            .block(
+                Block::default()
+                    .title(format!(
+                        " Files: {}/{} ",
+                        syncing.completed_actions, syncing.total_actions
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .gauge_style(Style::default().fg(Color::Green))
+            .ratio(files_progress);
+        frame.render_widget(files_gauge, chunks[0]);
+
+        // Bytes progress bar
+        let bytes_progress = if syncing.total_bytes > 0 {
+            syncing.transferred_bytes as f64 / syncing.total_bytes as f64
+        } else {
+            1.0
+        };
+        let bytes_gauge = Gauge::default()
+            .block(
+                Block::default()
+                    .title(format!(
+                        " Transferred: {} / {} ",
+                        format_bytes(syncing.transferred_bytes),
+                        format_bytes(syncing.total_bytes)
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .gauge_style(Style::default().fg(Color::Cyan))
+            .ratio(bytes_progress);
+        frame.render_widget(bytes_gauge, chunks[1]);
+
+        // Current file
+        let current_file = Paragraph::new(Line::from(vec![
+            Span::styled("Current: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(syncing.current_file.display().to_string()),
+        ]));
+        frame.render_widget(current_file, chunks[2]);
+
+        // Time info
+        let elapsed = format_duration(syncing.elapsed());
+        let remaining = syncing
+            .estimated_remaining()
+            .map(format_duration)
+            .unwrap_or_else(|| "calculating...".to_string());
+
+        let time_info = Paragraph::new(Line::from(vec![
+            Span::styled("Elapsed: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(&elapsed),
+            Span::raw("  "),
+            Span::styled("Remaining: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(&remaining),
+        ]));
+        frame.render_widget(time_info, chunks[3]);
+    }
+
+    fn render_sync_complete(&self, frame: &mut Frame, area: Rect) {
+        let Some(ref complete) = self.sync_complete else {
+            return;
+        };
+
+        let has_errors = !complete.failed.is_empty();
+        let has_changed = !complete.changed_during_sync.is_empty();
+
+        let chunks = Layout::vertical([
+            Constraint::Length(7), // Summary
+            if has_errors {
+                Constraint::Min(5)
+            } else {
+                Constraint::Length(0)
+            }, // Errors list
+            if has_changed {
+                Constraint::Length(3)
+            } else {
+                Constraint::Length(0)
+            }, // Changed files notice
+        ])
+        .split(area);
+
+        // Summary
+        let summary_lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Completed: ", Style::default().fg(Color::Green)),
+                Span::raw(format!("{} actions", complete.completed.len())),
+            ]),
+            Line::from(vec![
+                Span::styled("Failed: ", Style::default().fg(Color::Red)),
+                Span::raw(format!("{} actions", complete.failed.len())),
+            ]),
+            Line::from(vec![
+                Span::styled("Skipped: ", Style::default().fg(Color::Yellow)),
+                Span::raw(format!("{} actions", complete.skipped.len())),
+            ]),
+            Line::from(vec![
+                Span::styled("Time: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format_duration(complete.duration)),
+                Span::raw("  "),
+                Span::styled("Transferred: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format_bytes(complete.bytes_transferred)),
+            ]),
+        ];
+
+        let summary = Paragraph::new(summary_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Sync Complete ")
+                .border_style(Style::default().fg(Color::Green)),
+        );
+        frame.render_widget(summary, chunks[0]);
+
+        // Errors list
+        if has_errors {
+            let visible_height = chunks[1].height.saturating_sub(2) as usize;
+            let error_items: Vec<ListItem> = complete
+                .failed
+                .iter()
+                .skip(complete.scroll_offset)
+                .take(visible_height)
+                .map(|f| {
+                    let path = match &f.action {
+                        SyncAction::CopyToRight { path, .. }
+                        | SyncAction::CopyToLeft { path, .. }
+                        | SyncAction::DeleteRight { path }
+                        | SyncAction::DeleteLeft { path } => path.display().to_string(),
+                        _ => "unknown".to_string(),
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled("✗ ", Style::default().fg(Color::Red)),
+                        Span::raw(path),
+                        Span::styled(" - ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(&f.error),
+                    ]))
+                })
+                .collect();
+
+            let errors_list = List::new(error_items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" Errors ({}) ", complete.failed.len()))
+                    .border_style(Style::default().fg(Color::Red)),
+            );
+            frame.render_widget(errors_list, chunks[1]);
+        }
+
+        // Changed files notice
+        if has_changed {
+            let notice = Paragraph::new(Line::from(vec![
+                Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
+                Span::raw(format!(
+                    "{} files changed during sync. Press ",
+                    complete.changed_during_sync.len()
+                )),
+                Span::styled(" R ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+                Span::raw(" to re-analyze."),
+            ]))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+            frame.render_widget(notice, chunks[2]);
+        }
+    }
 }
 
 // Helper functions
@@ -1576,6 +2351,19 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    if hours > 0 {
+        format!("{}:{:02}:{:02}", hours, minutes, seconds)
+    } else {
+        format!("{}:{:02}", minutes, seconds)
     }
 }
 
