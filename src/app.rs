@@ -4,7 +4,10 @@ use ratatui::{
     layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{
+        Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState,
+    },
     Frame,
 };
 use std::collections::{HashMap, HashSet};
@@ -106,18 +109,14 @@ impl UserAction {
                 SyncAction::Skip { .. } | SyncAction::Conflict { .. } => None,
                 _ => Some(action.clone()),
             },
-            UserAction::CopyToRight { path, size } => {
-                Some(SyncAction::CopyToRight {
-                    path: path.clone(),
-                    size: *size,
-                })
-            }
-            UserAction::CopyToLeft { path, size } => {
-                Some(SyncAction::CopyToLeft {
-                    path: path.clone(),
-                    size: *size,
-                })
-            }
+            UserAction::CopyToRight { path, size } => Some(SyncAction::CopyToRight {
+                path: path.clone(),
+                size: *size,
+            }),
+            UserAction::CopyToLeft { path, size } => Some(SyncAction::CopyToLeft {
+                path: path.clone(),
+                size: *size,
+            }),
             UserAction::Skip { .. } => None,
         }
     }
@@ -200,6 +199,26 @@ impl PreviewState {
             }
         }
         summary
+    }
+
+    /// Get file size from left scan by path
+    fn get_file_size_from_left(&self, path: &Path) -> Option<u64> {
+        self.left_scan
+            .as_ref()?
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.size)
+    }
+
+    /// Get file size from right scan by path
+    fn get_file_size_from_right(&self, path: &Path) -> Option<u64> {
+        self.right_scan
+            .as_ref()?
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.size)
     }
 }
 
@@ -928,7 +947,8 @@ impl App {
             if let Some(&real_idx) = indices.get(preview.selected) {
                 if let Some(action) = preview.actions.get(real_idx) {
                     let path = action.path().clone();
-                    let size = get_action_size(action);
+                    // CopyToLeft means source is RIGHT side - get size from right_scan
+                    let size = preview.get_file_size_from_right(&path).unwrap_or(0);
                     preview.actions[real_idx] = UserAction::CopyToLeft { path, size };
                 }
             }
@@ -941,7 +961,8 @@ impl App {
             if let Some(&real_idx) = indices.get(preview.selected) {
                 if let Some(action) = preview.actions.get(real_idx) {
                     let path = action.path().clone();
-                    let size = get_action_size(action);
+                    // CopyToRight means source is LEFT side - get size from left_scan
+                    let size = preview.get_file_size_from_left(&path).unwrap_or(0);
                     preview.actions[real_idx] = UserAction::CopyToRight { path, size };
                 }
             }
@@ -1277,29 +1298,51 @@ impl App {
         // Update metadata based on completed actions
         for completed in &result.completed {
             match &completed.action {
-                SyncAction::CopyToRight { path, size } => {
-                    let file_state = FileState {
-                        path: path.to_string_lossy().to_string(),
-                        size: *size,
-                        mtime: now,
-                        hash: None,
-                        attributes: FileAttributes::default(),
-                        last_synced: now,
-                    };
-                    left_meta.upsert_file(file_state.clone());
-                    right_meta.upsert_file(file_state);
+                SyncAction::CopyToRight { path, .. } => {
+                    // Read actual file metadata from disk (destination file)
+                    let dest_path = project.right_path.join(path);
+                    if let Ok(metadata) = std::fs::metadata(&dest_path) {
+                        let mtime = metadata
+                            .modified()
+                            .ok()
+                            .and_then(|t| chrono::DateTime::<Utc>::from(t).into())
+                            .unwrap_or(now);
+                        let size = metadata.len();
+
+                        let file_state = FileState {
+                            path: path.to_string_lossy().to_string(),
+                            size,
+                            mtime,
+                            hash: None,
+                            attributes: FileAttributes::default(),
+                            last_synced: now,
+                        };
+                        left_meta.upsert_file(file_state.clone());
+                        right_meta.upsert_file(file_state);
+                    }
                 }
-                SyncAction::CopyToLeft { path, size } => {
-                    let file_state = FileState {
-                        path: path.to_string_lossy().to_string(),
-                        size: *size,
-                        mtime: now,
-                        hash: None,
-                        attributes: FileAttributes::default(),
-                        last_synced: now,
-                    };
-                    left_meta.upsert_file(file_state.clone());
-                    right_meta.upsert_file(file_state);
+                SyncAction::CopyToLeft { path, .. } => {
+                    // Read actual file metadata from disk (destination file)
+                    let dest_path = project.left_path.join(path);
+                    if let Ok(metadata) = std::fs::metadata(&dest_path) {
+                        let mtime = metadata
+                            .modified()
+                            .ok()
+                            .and_then(|t| chrono::DateTime::<Utc>::from(t).into())
+                            .unwrap_or(now);
+                        let size = metadata.len();
+
+                        let file_state = FileState {
+                            path: path.to_string_lossy().to_string(),
+                            size,
+                            mtime,
+                            hash: None,
+                            attributes: FileAttributes::default(),
+                            last_synced: now,
+                        };
+                        left_meta.upsert_file(file_state.clone());
+                        right_meta.upsert_file(file_state);
+                    }
                 }
                 SyncAction::DeleteRight { path } => {
                     let path_str = path.to_string_lossy().to_string();
@@ -1633,8 +1676,7 @@ impl App {
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None);
-            let mut scrollbar_state =
-                ScrollbarState::new(indices.len()).position(preview.selected);
+            let mut scrollbar_state = ScrollbarState::new(indices.len()).position(preview.selected);
             frame.render_stateful_widget(
                 scrollbar,
                 chunks[0].inner(Margin::new(0, 1)),
@@ -1751,7 +1793,10 @@ impl App {
                 if let Some(ref complete) = self.sync_complete {
                     if !complete.changed_during_sync.is_empty() {
                         hints.extend(vec![
-                            Span::styled(" R ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+                            Span::styled(
+                                " R ",
+                                Style::default().fg(Color::Black).bg(Color::Yellow),
+                            ),
                             Span::raw(" Re-analyze  "),
                         ]);
                     }
@@ -2002,7 +2047,10 @@ impl App {
             Line::from("Start synchronization?"),
             Line::from(""),
             Line::from(vec![
-                Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Green)),
+                Span::styled(
+                    " Enter ",
+                    Style::default().fg(Color::Black).bg(Color::Green),
+                ),
                 Span::raw(" Start  "),
                 Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
                 Span::raw(" Cancel"),
@@ -2060,8 +2108,7 @@ impl App {
         .split(area);
 
         // Files progress bar
-        let files_progress =
-            syncing.completed_actions as f64 / syncing.total_actions.max(1) as f64;
+        let files_progress = syncing.completed_actions as f64 / syncing.total_actions.max(1) as f64;
         let files_gauge = Gauge::default()
             .block(
                 Block::default()
@@ -2270,24 +2317,22 @@ fn is_conflict_action(action: &UserAction) -> bool {
     matches!(action, UserAction::Original(SyncAction::Conflict { .. }))
 }
 
-fn get_action_size(action: &UserAction) -> u64 {
-    match action {
-        UserAction::Original(SyncAction::CopyToRight { size, .. }) => *size,
-        UserAction::Original(SyncAction::CopyToLeft { size, .. }) => *size,
-        UserAction::CopyToRight { size, .. } => *size,
-        UserAction::CopyToLeft { size, .. } => *size,
-        _ => 0,
-    }
-}
-
-fn render_action_item(action: &UserAction, is_selected: bool, is_marked: bool) -> ListItem<'static> {
+fn render_action_item(
+    action: &UserAction,
+    is_selected: bool,
+    is_marked: bool,
+) -> ListItem<'static> {
     let (symbol, color, path_str) = match action {
-        UserAction::Original(SyncAction::CopyToRight { path, size }) => {
-            ("→", Color::Green, format!("{} ({})", path.display(), format_bytes(*size)))
-        }
-        UserAction::Original(SyncAction::CopyToLeft { path, size }) => {
-            ("←", Color::Blue, format!("{} ({})", path.display(), format_bytes(*size)))
-        }
+        UserAction::Original(SyncAction::CopyToRight { path, size }) => (
+            "→",
+            Color::Green,
+            format!("{} ({})", path.display(), format_bytes(*size)),
+        ),
+        UserAction::Original(SyncAction::CopyToLeft { path, size }) => (
+            "←",
+            Color::Blue,
+            format!("{} ({})", path.display(), format_bytes(*size)),
+        ),
         UserAction::Original(SyncAction::DeleteRight { path }) => {
             ("✕→", Color::Red, path.display().to_string())
         }
@@ -2306,17 +2351,25 @@ fn render_action_item(action: &UserAction, is_selected: bool, is_marked: bool) -
                 ConflictReason::ModifiedAndDeleted => "mod vs del",
                 ConflictReason::ExistsVsDeleted => "exists vs del",
             };
-            ("⚠", Color::Yellow, format!("{} ({})", path.display(), reason_str))
+            (
+                "⚠",
+                Color::Yellow,
+                format!("{} ({})", path.display(), reason_str),
+            )
         }
         UserAction::Original(SyncAction::Skip { path, .. }) => {
             ("·", Color::DarkGray, path.display().to_string())
         }
-        UserAction::CopyToRight { path, size } => {
-            ("→*", Color::Green, format!("{} ({})", path.display(), format_bytes(*size)))
-        }
-        UserAction::CopyToLeft { path, size } => {
-            ("←*", Color::Blue, format!("{} ({})", path.display(), format_bytes(*size)))
-        }
+        UserAction::CopyToRight { path, size } => (
+            "→*",
+            Color::Green,
+            format!("{} ({})", path.display(), format_bytes(*size)),
+        ),
+        UserAction::CopyToLeft { path, size } => (
+            "←*",
+            Color::Blue,
+            format!("{} ({})", path.display(), format_bytes(*size)),
+        ),
         UserAction::Skip { path } => ("·*", Color::DarkGray, path.display().to_string()),
     };
 
@@ -2502,7 +2555,11 @@ mod tests {
     fn test_back_from_project_view() {
         let (mut app, _temp) = create_test_app();
         app.screen = Screen::ProjectView;
-        app.current_project = Some(Project::new("test", PathBuf::from("/l"), PathBuf::from("/r")));
+        app.current_project = Some(Project::new(
+            "test",
+            PathBuf::from("/l"),
+            PathBuf::from("/r"),
+        ));
 
         app.handle_key(KeyCode::Esc);
 

@@ -365,7 +365,11 @@ mod tests {
         // Valid names
         for name in &["simple", "with-dash", "with_underscore", "Mixed123"] {
             let project = sample_project(name);
-            assert!(manager.save_project(&project).is_ok(), "Name '{}' should be valid", name);
+            assert!(
+                manager.save_project(&project).is_ok(),
+                "Name '{}' should be valid",
+                name
+            );
         }
     }
 
