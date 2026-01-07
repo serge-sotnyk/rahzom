@@ -47,32 +47,39 @@ A lightweight cross-platform utility for bidirectional folder synchronization be
 6. Click "Sync" — execute synchronization
 ```
 
-## Project Structure (Preliminary)
+## Project Structure
 
 ```
 rahzom/
 ├── src/
 │   ├── main.rs           # Entry point, TUI initialization
-│   ├── app.rs            # Application state, main loop
-│   ├── ui/               # Interface components
+│   ├── lib.rs            # Re-exports for testing
+│   ├── app/              # Application module
+│   │   ├── mod.rs        # App struct, business logic, rendering
+│   │   ├── state.rs      # Screen, Dialog, PreviewState, etc.
+│   │   └── handlers.rs   # Event handling (keyboard, mouse)
+│   ├── ui/               # UI components
 │   │   ├── mod.rs
-│   │   ├── file_list.rs  # File/change list display
-│   │   ├── preview.rs    # Preview screen before sync
-│   │   └── config.rs     # Folder pair configuration
+│   │   ├── widgets.rs    # Helpers: format_bytes, centered_rect, etc.
+│   │   ├── dialogs.rs    # Dialog rendering functions
+│   │   ├── screens.rs    # Main screen rendering
+│   │   └── sync_ui.rs    # Sync progress screens
 │   ├── sync/             # Synchronization logic
 │   │   ├── mod.rs
 │   │   ├── scanner.rs    # Filesystem scanning
 │   │   ├── differ.rs     # State comparison, action determination
 │   │   ├── executor.rs   # Copy/delete operation execution
-│   │   └── metadata.rs   # Sidecar metadata handling
+│   │   ├── metadata.rs   # Sidecar metadata handling
+│   │   └── utils.rs      # Shared utilities (FAT32 tolerance)
 │   └── config/           # Application configuration
 │       ├── mod.rs
-│       └── pairs.rs      # Sync pair storage
+│       └── project.rs    # Project settings (~/.rahzom/)
+├── tests/
+│   ├── common/
+│   │   └── mod.rs        # Test utilities, data generators
+│   └── test_common.rs
 ├── Cargo.toml
-├── README.md
-└── .github/
-    └── workflows/
-        └── release.yml   # CI/CD for cross-platform builds
+└── README.md
 ```
 
 ## Dependencies (Cargo.toml)

@@ -297,9 +297,9 @@ impl Executor {
             .map_err(|e| ExecuteError::Failed(e.to_string()))?;
         let mtime_utc = system_time_to_utc(mtime);
 
-        // Allow 2 second tolerance for FAT32
+        // Allow FAT32 tolerance for mtime comparison
         let diff = (mtime_utc - snapshot.mtime).num_seconds().abs();
-        if diff > 2 {
+        if diff > super::utils::FAT32_TOLERANCE_SECS {
             return Ok(false);
         }
 

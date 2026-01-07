@@ -5,9 +5,7 @@ use chrono::{DateTime, Utc};
 
 use super::metadata::SyncMetadata;
 use super::scanner::ScanResult;
-
-/// FAT32 filesystem has 2-second mtime precision
-const FAT32_TOLERANCE_SECS: i64 = 2;
+use super::utils::FAT32_TOLERANCE_SECS;
 
 /// Information about a file for conflict reporting
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +50,22 @@ pub enum SyncAction {
     },
     /// Skip this file (no action needed)
     Skip { path: PathBuf, reason: String },
+}
+
+impl SyncAction {
+    /// Returns the path associated with this action
+    pub fn path(&self) -> &PathBuf {
+        match self {
+            Self::CopyToRight { path, .. } => path,
+            Self::CopyToLeft { path, .. } => path,
+            Self::DeleteRight { path } => path,
+            Self::DeleteLeft { path } => path,
+            Self::CreateDirRight { path } => path,
+            Self::CreateDirLeft { path } => path,
+            Self::Conflict { path, .. } => path,
+            Self::Skip { path, .. } => path,
+        }
+    }
 }
 
 /// Result of comparing two sides

@@ -19,6 +19,7 @@
 | 7 | TUI: Project List | 0.5-1 day | Startup screen with project selection |
 | 8 | TUI: Analyze & Preview | 1-1.5 days | Tree view with proposed actions |
 | 9 | TUI: Sync Execution | 0.5-1 day | Progress display, sync execution |
+| 9b | Refactoring | 0.5 day | Split app.rs into modules |
 | 10 | Filtering & Exclusions | 0.5 day | Pattern-based exclusions |
 | 11 | Error Handling & Edge Cases | 1 day | Locked files, long paths, etc. |
 | 12 | Polish & Integration Tests | 1 day | End-to-end tests, README |
@@ -665,6 +666,74 @@ Scanner fails with "Failed to canonicalize path" when directory doesn't exist in
 - [x] Shows completion summary
 - [x] Errors displayed clearly
 - [x] Full cycle works: analyze → preview → modify → sync
+
+---
+
+## Stage 9b: Refactoring
+
+**Goal**: Split app.rs (2,725 lines) into manageable modules. No functional changes.
+
+**Version**: 0.10.0 → 0.10.1 (patch)
+
+### Target Structure
+
+```
+src/
+├── app.rs              # ~600 lines: App struct, run(), core methods
+├── app/
+│   ├── mod.rs          # Re-exports
+│   ├── state.rs        # Screen, Dialog enums, PreviewState, etc.
+│   └── handlers.rs     # Keyboard/mouse event handlers
+└── ui/
+    ├── mod.rs          # Re-exports
+    ├── dialogs.rs      # Dialog rendering
+    ├── screens.rs      # Screen rendering
+    ├── sync_ui.rs      # Sync progress/complete screens
+    └── widgets.rs      # format_bytes, centered_rect, helpers
+```
+
+### Tasks
+
+#### 9b.1 Extract UI widgets
+- `format_bytes()`, `format_duration()`, `centered_rect()` → `ui/widgets.rs`
+
+#### 9b.2 Extract dialogs
+- All `render_*_dialog()` functions → `ui/dialogs.rs`
+- Dialog structs: `NewProjectDialog`, `SyncConfirmDialog`
+
+#### 9b.3 Extract screen rendering
+- `render_project_list()`, `render_preview()`, etc. → `ui/screens.rs`
+- `render_syncing()`, `render_sync_complete()` → `ui/sync_ui.rs`
+
+#### 9b.4 Extract state types
+- Enums: `Screen`, `Dialog`, `DialogField`, `PreviewFilter` → `app/state.rs`
+- Structs: `PreviewState`, `SyncingState`, `SyncCompleteState` → `app/state.rs`
+
+#### 9b.5 Extract event handlers
+- All `handle_key_*()` methods → `app/handlers.rs`
+
+#### 9b.6 Eliminate code duplication
+- FAT32 tolerance (duplicated in differ.rs and executor.rs) → `sync/utils.rs`
+
+#### 9b.7 Update documentation
+- Update project structure in: `docs/ARCHITECTURE.md`, `README.md`, `CLAUDE.md`
+
+### Definition of Done
+- [x] app.rs reduced from 2,725 to ~1,073 lines (app/mod.rs)
+- [x] All 73 tests pass
+- [x] `cargo clippy` clean
+- [x] No functional changes (same behavior)
+- [x] Documentation updated
+
+### Result
+- `app/mod.rs`: 1,073 lines (was 2,725 in app.rs — 61% reduction)
+- `app/state.rs`: 352 lines
+- `app/handlers.rs`: 546 lines
+- `ui/widgets.rs`: 92 lines
+- `ui/dialogs.rs`: 271 lines
+- `ui/screens.rs`: 296 lines
+- `ui/sync_ui.rs`: 194 lines
+- `sync/utils.rs`: 38 lines
 
 ---
 

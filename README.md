@@ -29,7 +29,7 @@ cargo fmt                        # Format code
 ## Architecture
 
 ```
-User → TUI (ui/) → App State (app.rs) → Sync Logic (sync/) → Filesystem
+User → TUI (ui/) → App State (app/) → Sync Logic (sync/) → Filesystem
                                              ↓
                                     Config (config/) → ~/.rahzom/
                                              ↓
@@ -42,27 +42,31 @@ User → TUI (ui/) → App State (app.rs) → Sync Logic (sync/) → Filesystem
 src/
 ├── main.rs           # Entry point, TUI initialization
 ├── lib.rs            # Re-exports for testing
-├── app.rs            # Application state, main loop
+├── app/              # Application module
+│   ├── mod.rs        # App struct, business logic, rendering
+│   ├── state.rs      # Screen, Dialog, PreviewState, etc.
+│   └── handlers.rs   # Event handling (keyboard, mouse)
 ├── sync/             # Core synchronization logic
 │   ├── mod.rs
 │   ├── scanner.rs    # Filesystem scanning
 │   ├── differ.rs     # Compare states, generate actions
 │   ├── executor.rs   # Execute copy/delete operations
-│   └── metadata.rs   # .rahzom/ folder management
+│   ├── metadata.rs   # .rahzom/ folder management
+│   └── utils.rs      # Shared utilities (FAT32 tolerance)
 ├── config/           # Project configuration
 │   ├── mod.rs
 │   └── project.rs    # Project settings (~/.rahzom/)
 └── ui/               # TUI components
     ├── mod.rs
-    ├── project_list.rs
-    ├── preview.rs
-    └── progress.rs
+    ├── widgets.rs    # Helpers: format_bytes, centered_rect
+    ├── dialogs.rs    # Dialog rendering functions
+    ├── screens.rs    # Main screen rendering
+    └── sync_ui.rs    # Sync progress screens
 
 tests/
 ├── common/
 │   └── mod.rs        # Test utilities, data generators
-└── integration/
-    └── mod.rs
+└── test_common.rs
 ```
 
 ### Key Concepts
