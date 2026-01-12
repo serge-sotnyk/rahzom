@@ -31,6 +31,7 @@ pub enum Dialog {
     Error(String),
     SyncConfirm(SyncConfirmDialog),
     CancelSyncConfirm,
+    ExclusionsInfo(ExclusionsInfoDialog),
 }
 
 /// Filter mode for preview
@@ -129,6 +130,17 @@ pub struct SyncConfirmDialog {
     pub dirs_to_create: usize,
 }
 
+/// Exclusions info dialog data
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExclusionsInfoDialog {
+    pub left_path: PathBuf,
+    pub right_path: PathBuf,
+    pub left_exists: bool,
+    pub right_exists: bool,
+    pub left_count: usize,
+    pub right_count: usize,
+}
+
 /// Action that user can modify
 #[derive(Debug, Clone, PartialEq)]
 pub enum UserAction {
@@ -138,6 +150,10 @@ pub enum UserAction {
     CopyToRight { path: PathBuf, size: u64 },
     /// User changed to copy right to left
     CopyToLeft { path: PathBuf, size: u64 },
+    /// User changed to delete from left
+    DeleteLeft { path: PathBuf },
+    /// User changed to delete from right
+    DeleteRight { path: PathBuf },
     /// User chose to skip this item
     Skip { path: PathBuf },
 }
@@ -148,6 +164,8 @@ impl UserAction {
             Self::Original(action) => action.path(),
             Self::CopyToRight { path, .. } => path,
             Self::CopyToLeft { path, .. } => path,
+            Self::DeleteLeft { path } => path,
+            Self::DeleteRight { path } => path,
             Self::Skip { path } => path,
         }
     }
@@ -171,6 +189,12 @@ impl UserAction {
             UserAction::CopyToLeft { path, size } => Some(SyncAction::CopyToLeft {
                 path: path.clone(),
                 size: *size,
+            }),
+            UserAction::DeleteLeft { path } => Some(SyncAction::DeleteLeft {
+                path: path.clone(),
+            }),
+            UserAction::DeleteRight { path } => Some(SyncAction::DeleteRight {
+                path: path.clone(),
             }),
             UserAction::Skip { .. } => None,
         }
@@ -247,10 +271,12 @@ impl PreviewState {
                     summary.copy_to_left += 1;
                     summary.bytes_to_left += size;
                 }
-                UserAction::Original(SyncAction::DeleteRight { .. }) => {
+                UserAction::Original(SyncAction::DeleteRight { .. })
+                | UserAction::DeleteRight { .. } => {
                     summary.delete_right += 1;
                 }
-                UserAction::Original(SyncAction::DeleteLeft { .. }) => {
+                UserAction::Original(SyncAction::DeleteLeft { .. })
+                | UserAction::DeleteLeft { .. } => {
                     summary.delete_left += 1;
                 }
                 UserAction::Original(SyncAction::Conflict { .. }) => {

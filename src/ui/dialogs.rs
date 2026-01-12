@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{DialogField, NewProjectDialog, SyncConfirmDialog};
+use crate::app::{DialogField, ExclusionsInfoDialog, NewProjectDialog, SyncConfirmDialog};
 use crate::ui::{centered_rect, format_bytes};
 
 /// Renders new project dialog
@@ -266,6 +266,82 @@ pub fn render_cancel_sync_confirm_dialog(frame: &mut Frame) {
             Span::raw(" No"),
         ]),
     ];
+
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
+}
+
+/// Renders exclusions info dialog
+pub fn render_exclusions_info_dialog(frame: &mut Frame, dialog: &ExclusionsInfoDialog) {
+    let area = centered_rect(70, 14, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Exclusion Patterns (.rahzomignore) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let left_status = if dialog.left_exists {
+        Span::styled(
+            format!("{} patterns", dialog.left_count),
+            Style::default().fg(Color::Green),
+        )
+    } else {
+        Span::styled("not created", Style::default().fg(Color::DarkGray))
+    };
+
+    let right_status = if dialog.right_exists {
+        Span::styled(
+            format!("{} patterns", dialog.right_count),
+            Style::default().fg(Color::Green),
+        )
+    } else {
+        Span::styled("not created", Style::default().fg(Color::DarkGray))
+    };
+
+    let can_create = !dialog.left_exists || !dialog.right_exists;
+
+    let mut text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Left:  ", Style::default().fg(Color::DarkGray)),
+            left_status,
+        ]),
+        Line::from(Span::styled(
+            format!("  {}", dialog.left_path.display()),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Right: ", Style::default().fg(Color::DarkGray)),
+            right_status,
+        ]),
+        Line::from(Span::styled(
+            format!("  {}", dialog.right_path.display()),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    if can_create {
+        text.push(Line::from(vec![
+            Span::styled(" T ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::raw(" Create template  "),
+            Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" Close"),
+        ]));
+    } else {
+        text.push(Line::from(Span::styled(
+            "Edit .rahzomignore files manually",
+            Style::default().fg(Color::DarkGray),
+        )));
+        text.push(Line::from(vec![
+            Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" Close"),
+        ]));
+    }
 
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
 }

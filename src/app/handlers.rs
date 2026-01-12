@@ -41,6 +41,7 @@ impl App {
             Dialog::Error(_) => self.handle_key_error(code),
             Dialog::SyncConfirm(_) => self.handle_key_sync_confirm(code),
             Dialog::CancelSyncConfirm => self.handle_key_cancel_sync_confirm(code),
+            Dialog::ExclusionsInfo(_) => self.handle_key_exclusions_info(code),
         }
     }
 
@@ -147,6 +148,9 @@ impl App {
             }
             KeyCode::Char(' ') => {
                 self.toggle_selection();
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                self.show_exclusions_dialog();
             }
             KeyCode::Home => {
                 if let Some(ref mut preview) = self.preview {
@@ -269,6 +273,18 @@ impl App {
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.dialog = Dialog::None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_exclusions_info(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.dialog = Dialog::None;
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Enter => {
+                self.create_exclusions_template();
             }
             _ => {}
         }
@@ -481,9 +497,14 @@ impl App {
             if let Some(&real_idx) = indices.get(preview.selected) {
                 if let Some(action) = preview.actions.get(real_idx) {
                     let path = action.path().clone();
-                    // CopyToLeft means source is RIGHT side - get size from right_scan
-                    let size = preview.get_file_size_from_right(&path).unwrap_or(0);
-                    preview.actions[real_idx] = UserAction::CopyToLeft { path, size };
+                    // CopyToLeft means source is RIGHT side
+                    // If file exists on right, copy to left
+                    // If file doesn't exist on right, delete from left
+                    if let Some(size) = preview.get_file_size_from_right(&path) {
+                        preview.actions[real_idx] = UserAction::CopyToLeft { path, size };
+                    } else {
+                        preview.actions[real_idx] = UserAction::DeleteLeft { path };
+                    }
                 }
             }
         }
@@ -495,9 +516,14 @@ impl App {
             if let Some(&real_idx) = indices.get(preview.selected) {
                 if let Some(action) = preview.actions.get(real_idx) {
                     let path = action.path().clone();
-                    // CopyToRight means source is LEFT side - get size from left_scan
-                    let size = preview.get_file_size_from_left(&path).unwrap_or(0);
-                    preview.actions[real_idx] = UserAction::CopyToRight { path, size };
+                    // CopyToRight means source is LEFT side
+                    // If file exists on left, copy to right
+                    // If file doesn't exist on left, delete from right
+                    if let Some(size) = preview.get_file_size_from_left(&path) {
+                        preview.actions[real_idx] = UserAction::CopyToRight { path, size };
+                    } else {
+                        preview.actions[real_idx] = UserAction::DeleteRight { path };
+                    }
                 }
             }
         }

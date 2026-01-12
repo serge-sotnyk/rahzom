@@ -4,9 +4,9 @@ mod handlers;
 pub mod state;
 
 pub use state::{
-    is_conflict_action, is_skip_action, Dialog, DialogField, NewProjectDialog, PreviewFilter,
-    PreviewState, PreviewSummary, Screen, SyncCompleteState, SyncConfirmDialog, SyncingState,
-    UserAction,
+    is_conflict_action, is_skip_action, Dialog, DialogField, ExclusionsInfoDialog,
+    NewProjectDialog, PreviewFilter, PreviewState, PreviewSummary, Screen, SyncCompleteState,
+    SyncConfirmDialog, SyncingState, UserAction,
 };
 
 use anyhow::Result;
@@ -23,14 +23,15 @@ use std::time::Instant;
 
 use crate::config::project::{Project, ProjectManager};
 use crate::sync::differ::{diff, SyncAction};
+use crate::sync::exclusions::Exclusions;
 use crate::sync::executor::{ExecutionResult, Executor, ExecutorConfig, FailedAction, FileSnapshot, NoopProgress};
 use crate::sync::metadata::{DeletedFile, FileAttributes, FileState, SyncMetadata};
-use crate::sync::scanner::scan;
+use crate::sync::scanner::scan_with_exclusions;
 use crate::ui::{
     render_cancel_sync_confirm_dialog, render_create_dir_confirm_dialog,
-    render_delete_confirm_dialog, render_error_dialog, render_new_project_dialog,
-    render_preview, render_project_list, render_project_view, render_sync_complete,
-    render_sync_confirm_dialog, render_syncing,
+    render_delete_confirm_dialog, render_error_dialog, render_exclusions_info_dialog,
+    render_new_project_dialog, render_preview, render_project_list, render_project_view,
+    render_sync_complete, render_sync_confirm_dialog, render_syncing,
 };
 use chrono::Utc;
 
@@ -57,6 +58,10 @@ pub struct App {
     // Sync complete state
     pub sync_complete: Option<SyncCompleteState>,
 
+    // Exclusions state
+    pub left_exclusions: Option<Exclusions>,
+    pub right_exclusions: Option<Exclusions>,
+
     // Mouse tracking
     last_click: Option<(u16, u16, Instant)>,
     content_area: Option<Rect>,
@@ -81,6 +86,8 @@ impl App {
             preview: None,
             syncing: None,
             sync_complete: None,
+            left_exclusions: None,
+            right_exclusions: None,
             last_click: None,
             content_area: None,
         };
@@ -123,6 +130,8 @@ impl App {
             preview: None,
             syncing: None,
             sync_complete: None,
+            left_exclusions: None,
+            right_exclusions: None,
             last_click: None,
             content_area: None,
         }
@@ -195,8 +204,16 @@ impl App {
             return;
         }
 
-        // Scan both sides
-        let left_scan = match scan(&project.left_path) {
+        // Load exclusions (opt-in: returns empty if file doesn't exist)
+        let left_exclusions = Exclusions::load(&project.left_path).ok();
+        let right_exclusions = Exclusions::load(&project.right_path).ok();
+
+        // Store exclusions for UI
+        self.left_exclusions = left_exclusions.clone();
+        self.right_exclusions = right_exclusions.clone();
+
+        // Scan both sides with exclusions
+        let left_scan = match scan_with_exclusions(&project.left_path, left_exclusions.as_ref()) {
             Ok(s) => s,
             Err(e) => {
                 self.dialog = Dialog::Error(format!("Failed to scan left: {}", e));
@@ -204,7 +221,7 @@ impl App {
             }
         };
 
-        let right_scan = match scan(&project.right_path) {
+        let right_scan = match scan_with_exclusions(&project.right_path, right_exclusions.as_ref()) {
             Ok(s) => s,
             Err(e) => {
                 self.dialog = Dialog::Error(format!("Failed to scan right: {}", e));
@@ -577,6 +594,58 @@ impl App {
         }
     }
 
+    fn show_exclusions_dialog(&mut self) {
+        let Some(ref project) = self.current_project else {
+            return;
+        };
+
+        let left_path = Exclusions::file_path(&project.left_path);
+        let right_path = Exclusions::file_path(&project.right_path);
+        let left_exists = left_path.exists();
+        let right_exists = right_path.exists();
+        let left_count = self.left_exclusions.as_ref().map(|e| e.len()).unwrap_or(0);
+        let right_count = self.right_exclusions.as_ref().map(|e| e.len()).unwrap_or(0);
+
+        self.dialog = Dialog::ExclusionsInfo(ExclusionsInfoDialog {
+            left_path,
+            right_path,
+            left_exists,
+            right_exists,
+            left_count,
+            right_count,
+        });
+    }
+
+    fn create_exclusions_template(&mut self) {
+        let Some(ref project) = self.current_project else {
+            return;
+        };
+
+        let template = Exclusions::default_template();
+        let left_path = Exclusions::file_path(&project.left_path);
+        let right_path = Exclusions::file_path(&project.right_path);
+
+        // Create on left side if doesn't exist
+        if !left_path.exists() {
+            if let Err(e) = std::fs::write(&left_path, &template) {
+                self.dialog = Dialog::Error(format!("Failed to create left exclusions: {}", e));
+                return;
+            }
+        }
+
+        // Create on right side if doesn't exist
+        if !right_path.exists() {
+            if let Err(e) = std::fs::write(&right_path, &template) {
+                self.dialog = Dialog::Error(format!("Failed to create right exclusions: {}", e));
+                return;
+            }
+        }
+
+        // Close dialog and re-run analyze to apply new exclusions
+        self.dialog = Dialog::None;
+        self.run_analyze();
+    }
+
     /// Render the application
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
@@ -611,6 +680,9 @@ impl App {
             }
             Dialog::CancelSyncConfirm => {
                 render_cancel_sync_confirm_dialog(frame);
+            }
+            Dialog::ExclusionsInfo(dialog) => {
+                render_exclusions_info_dialog(frame, dialog);
             }
         }
     }
@@ -732,7 +804,9 @@ impl App {
                     Span::styled(" S ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     Span::raw(" Skip  "),
                     Span::styled(" G ", Style::default().fg(Color::Black).bg(Color::Green)),
-                    Span::raw(" Go/Sync  "),
+                    Span::raw(" Go  "),
+                    Span::styled(" E ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" Excl  "),
                     Span::styled(" F ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     Span::raw(" Filter  "),
                     Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
@@ -790,7 +864,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::sync::differ::diff;
-    use crate::sync::scanner::scan;
+    use crate::sync::scanner::scan_with_exclusions;
     use crossterm::event::KeyCode;
     use tempfile::TempDir;
 
@@ -953,8 +1027,8 @@ mod tests {
 
         fs::write(temp_left.path().join("file.txt"), "content").unwrap();
 
-        let left_scan = scan(temp_left.path()).unwrap();
-        let right_scan = scan(temp_right.path()).unwrap();
+        let left_scan = scan_with_exclusions(temp_left.path(), None).unwrap();
+        let right_scan = scan_with_exclusions(temp_right.path(), None).unwrap();
         let left_meta = SyncMetadata::default();
         let right_meta = SyncMetadata::default();
 

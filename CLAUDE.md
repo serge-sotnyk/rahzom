@@ -28,6 +28,7 @@ src/
 │   ├── scanner.rs    # Filesystem scanning
 │   ├── differ.rs     # Compare states, generate actions
 │   ├── executor.rs   # Execute copy/delete operations
+│   ├── exclusions.rs # File exclusion patterns (.rahzomignore)
 │   ├── metadata.rs   # .rahzom/ folder management
 │   └── utils.rs      # Shared utilities (FAT32 tolerance)
 ├── config/           # Project configuration
@@ -72,6 +73,7 @@ Key crates used:
 - `chrono` — Date/time handling
 - `anyhow` — Error handling
 - `sha2` — Hashing (optional file verification)
+- `globset` — File exclusion pattern matching (.rahzomignore)
 - `dirs` — Platform-specific directories (~/.rahzom)
 - `tempfile` — Temporary directories for tests
 

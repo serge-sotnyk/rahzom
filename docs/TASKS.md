@@ -21,6 +21,8 @@
 | 9 | TUI: Sync Execution | 0.5-1 day | Progress display, sync execution |
 | 9b | Refactoring | 0.5 day | Split app.rs into modules |
 | 10 | Filtering & Exclusions | 0.5 day | Pattern-based exclusions |
+| 10b | Simplify Exclusions | 0.25 day | Move to .rahzomignore, opt-in |
+| 10c | Fix Direction Change | 0.1 day | Delete action for one-sided files |
 | 11 | Error Handling & Edge Cases | 1 day | Locked files, long paths, etc. |
 | 12 | Polish & Integration Tests | 1 day | End-to-end tests, README |
 
@@ -779,6 +781,97 @@ __pycache__/
 - [x] Default exclusions created
 - [x] Can edit exclusions
 - [x] Exclusions sync between sides
+
+---
+
+## Stage 10b: Simplify Exclusions System
+
+**Goal**: Simplify exclusions based on practical feedback.
+
+**Version**: 0.11.0 → 0.11.1 (patch)
+
+### Changes from Stage 10
+
+| Before | After |
+|--------|-------|
+| `.rahzom/exclusions.conf` (hidden) | `.rahzomignore` in root (visible, syncs naturally) |
+| Auto-created on first analyze | Opt-in only |
+| Built-in default exclusions | Only `.rahzom/` hardcoded |
+| Editor integration (L/R keys) | Manual editing |
+| Copy between sides (C/V keys) | File syncs naturally |
+
+### Tasks
+
+#### 10b.1 Move exclusions file
+- Change location from `.rahzom/exclusions.conf` to `.rahzomignore` in root
+- File syncs naturally between sides like any other file
+
+#### 10b.2 Make opt-in
+- No automatic creation of exclusions file
+- Add "Create template" command (T key in dialog)
+- Template includes common patterns + syntax comments
+
+#### 10b.3 Remove built-in defaults
+- Only `.rahzom/` folder is hardcoded (metadata)
+- All other exclusions come from `.rahzomignore` file
+
+#### 10b.4 Simplify UI
+- Remove editor integration (was L/R keys)
+- Remove copy between sides (was C/V keys)
+- Show file existence status and pattern counts
+- Add "Create template" option (T key)
+
+### Definition of Done
+- [x] `.rahzomignore` in root instead of `.rahzom/exclusions.conf`
+- [x] No auto-creation (opt-in)
+- [x] Create template command works
+- [x] UI simplified
+- [x] Tests pass
+
+---
+
+## Stage 10c: Fix Direction Change for One-Sided Files
+
+**Goal**: Fix bug where changing direction on one-sided files causes error.
+
+**Version**: 0.11.1 → 0.11.2 (patch)
+
+### Problem
+
+When file exists only on one side and user changes direction:
+- Original action: `CopyToRight` (file exists on left)
+- User presses LEFT arrow expecting to delete
+- Code changed to `CopyToLeft` which fails (no source on right)
+
+### Fix
+
+Arrows now mean "which side is source of truth":
+
+| File Location | RIGHT arrow (→) | LEFT arrow (←) |
+|---------------|-----------------|----------------|
+| Only on LEFT | CopyToRight | DeleteLeft |
+| Only on RIGHT | DeleteRight | CopyToLeft |
+| Both sides | CopyToRight | CopyToLeft |
+
+### Tasks
+
+#### 10c.1 Add new UserAction variants
+- Add `DeleteLeft { path }` and `DeleteRight { path }` to UserAction enum
+- Update `path()`, `to_sync_action()`, `summary()` methods
+
+#### 10c.2 Fix direction change logic
+- `change_action_to_left()`: if file doesn't exist on right → DeleteLeft
+- `change_action_to_right()`: if file doesn't exist on left → DeleteRight
+
+#### 10c.3 Update rendering
+- Add rendering for `UserAction::DeleteLeft` → "←✕*"
+- Add rendering for `UserAction::DeleteRight` → "✕→*"
+
+### Definition of Done
+- [x] New UserAction variants added
+- [x] Direction change creates delete action when appropriate
+- [x] Delete actions rendered correctly
+- [x] Tests pass
 
 ---
 

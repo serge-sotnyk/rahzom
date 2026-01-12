@@ -274,6 +274,8 @@ pub fn render_action_item(
             Color::Blue,
             format!("{} ({})", path.display(), format_bytes(*size)),
         ),
+        UserAction::DeleteLeft { path } => ("←✕*", Color::Red, path.display().to_string()),
+        UserAction::DeleteRight { path } => ("✕→*", Color::Red, path.display().to_string()),
         UserAction::Skip { path } => ("·*", Color::DarkGray, path.display().to_string()),
     };
 

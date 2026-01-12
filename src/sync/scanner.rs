@@ -7,6 +7,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use super::exclusions::Exclusions;
+
 /// Represents a single file or directory entry in the scan result
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -53,6 +55,18 @@ const SKIP_DIR: &str = ".rahzom";
 /// # Returns
 /// * `ScanResult` containing all found entries
 pub fn scan(root: &Path) -> Result<ScanResult> {
+    scan_with_exclusions(root, None)
+}
+
+/// Scans a directory with optional exclusion patterns.
+///
+/// # Arguments
+/// * `root` - Path to the directory to scan
+/// * `exclusions` - Optional exclusion patterns to filter out matching files
+///
+/// # Returns
+/// * `ScanResult` containing all found entries (excluding filtered files)
+pub fn scan_with_exclusions(root: &Path, exclusions: Option<&Exclusions>) -> Result<ScanResult> {
     let root = normalize_path(root)?;
     let mut entries = Vec::new();
     let mut skipped = Vec::new();
@@ -70,6 +84,20 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
                 // Skip .rahzom directory and its contents
                 if should_skip(path, &root) {
                     continue;
+                }
+
+                // Apply exclusion patterns
+                if let Some(excl) = exclusions {
+                    if let Ok(relative) = path.strip_prefix(&root) {
+                        let is_dir = path.is_dir();
+                        if excl.is_excluded(relative, is_dir) {
+                            skipped.push(SkippedEntry {
+                                path: path.to_path_buf(),
+                                reason: "Excluded by pattern".to_string(),
+                            });
+                            continue;
+                        }
+                    }
                 }
 
                 match process_entry(path, &root) {
@@ -197,6 +225,7 @@ fn system_time_to_utc(time: std::time::SystemTime) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::exclusions::Exclusions;
     use std::fs;
     use tempfile::TempDir;
 
@@ -330,5 +359,79 @@ mod tests {
                 &PathBuf::from("z.txt"),
             ]
         );
+    }
+
+    #[test]
+    fn test_scan_with_exclusions_filters_files() {
+        let temp = create_test_dir();
+
+        fs::write(temp.path().join("keep.txt"), "keep").unwrap();
+        fs::write(temp.path().join("exclude.tmp"), "exclude").unwrap();
+        fs::write(temp.path().join("also_keep.rs"), "code").unwrap();
+
+        let excl = Exclusions::from_patterns(&["*.tmp".to_string()]).unwrap();
+        let result = scan_with_exclusions(temp.path(), Some(&excl)).unwrap();
+
+        assert_eq!(result.entries.len(), 2);
+        assert!(result.entries.iter().any(|e| e.path == PathBuf::from("keep.txt")));
+        assert!(result.entries.iter().any(|e| e.path == PathBuf::from("also_keep.rs")));
+        assert!(!result.entries.iter().any(|e| e.path == PathBuf::from("exclude.tmp")));
+
+        // Excluded file should be in skipped list
+        assert!(result.skipped.iter().any(|s| s.reason.contains("Excluded")));
+    }
+
+    #[test]
+    fn test_scan_with_exclusions_filters_directories() {
+        let temp = create_test_dir();
+
+        fs::create_dir(temp.path().join("node_modules")).unwrap();
+        fs::write(temp.path().join("node_modules/pkg.json"), "{}").unwrap();
+        fs::create_dir(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        let excl = Exclusions::from_patterns(&["node_modules/".to_string()]).unwrap();
+        let result = scan_with_exclusions(temp.path(), Some(&excl)).unwrap();
+
+        // Should only have src and src/main.rs
+        assert_eq!(result.entries.len(), 2);
+        assert!(result.entries.iter().any(|e| e.path == PathBuf::from("src")));
+        assert!(result.entries.iter().any(|e| e.path == PathBuf::from("src/main.rs") || e.path == PathBuf::from("src\\main.rs")));
+
+        // node_modules directory and its contents should not be in entries
+        assert!(!result.entries.iter().any(|e| e.path.to_string_lossy().contains("node_modules")));
+    }
+
+    #[test]
+    fn test_scan_with_no_exclusions_same_as_scan() {
+        let temp = create_test_dir();
+
+        fs::write(temp.path().join("file.txt"), "content").unwrap();
+
+        let result1 = scan(temp.path()).unwrap();
+        let result2 = scan_with_exclusions(temp.path(), None).unwrap();
+
+        assert_eq!(result1.entries.len(), result2.entries.len());
+        assert_eq!(result1.entries[0].path, result2.entries[0].path);
+    }
+
+    #[test]
+    fn test_scan_with_multiple_exclusion_patterns() {
+        let temp = create_test_dir();
+
+        fs::write(temp.path().join("file.txt"), "keep").unwrap();
+        fs::write(temp.path().join("file.tmp"), "exclude").unwrap();
+        fs::write(temp.path().join("file.log"), "exclude").unwrap();
+        fs::write(temp.path().join(".DS_Store"), "exclude").unwrap();
+
+        let excl = Exclusions::from_patterns(&[
+            "*.tmp".to_string(),
+            "*.log".to_string(),
+            ".DS_Store".to_string(),
+        ]).unwrap();
+        let result = scan_with_exclusions(temp.path(), Some(&excl)).unwrap();
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, PathBuf::from("file.txt"));
     }
 }

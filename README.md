@@ -51,6 +51,7 @@ src/
 │   ├── scanner.rs    # Filesystem scanning
 │   ├── differ.rs     # Compare states, generate actions
 │   ├── executor.rs   # Execute copy/delete operations
+│   ├── exclusions.rs # File exclusion patterns
 │   ├── metadata.rs   # .rahzom/ folder management
 │   └── utils.rs      # Shared utilities (FAT32 tolerance)
 ├── config/           # Project configuration
@@ -75,6 +76,40 @@ tests/
 - **Metadata**: File state stored in `.rahzom/` inside each synced folder
 - **Sync flow**: Analyze → Preview (user can modify actions) → Sync
 
+## File Exclusions
+
+Exclusion patterns are stored in `.rahzomignore` file in the root of each synced folder.
+The file syncs naturally between sides like any other file.
+
+### Creating Exclusions
+
+Exclusions are opt-in. To create a `.rahzomignore` file:
+1. Press `E` in Preview screen to open exclusions dialog
+2. Press `T` to create template with common patterns on both sides
+3. Or create `.rahzomignore` manually in your text editor
+
+The `.rahzom/` metadata folder is always excluded automatically.
+
+### Pattern Syntax
+
+| Pattern | Description | Example |
+|---------|-------------|---------|
+| `*` | Matches any characters except `/` | `*.tmp` matches `file.tmp` |
+| `**` | Matches any characters including `/` | `**/*.log` matches `a/b/c/app.log` |
+| `?` | Matches single character | `file?.txt` matches `file1.txt` |
+| `[abc]` | Matches character class | `[0-9].txt` matches `1.txt` |
+| `{a,b}` | Matches alternatives | `*.{tmp,temp}` matches both |
+| `dir/` | Directory pattern (trailing `/`) | `node_modules/` excludes dir and contents |
+
+### Template Exclusions
+
+The template includes common patterns:
+- Temporary: `*.tmp`, `*.temp`, `~*`, `*~`
+- OS files: `.DS_Store`, `Thumbs.db`, `desktop.ini`
+- VCS: `.git/`, `.svn/`, `.hg/`
+- Development: `node_modules/`, `__pycache__/`, `target/`, `build/`
+- IDE: `.idea/`, `.vscode/`, `*.swp`
+
 ## Dependencies
 
 Key crates used:
@@ -84,6 +119,7 @@ Key crates used:
 - `chrono` — Date/time handling
 - `anyhow` — Error handling
 - `sha2` — Hashing (optional file verification)
+- `globset` — File exclusion pattern matching
 - `dirs` — Platform-specific directories (~/.rahzom)
 - `tempfile` — Temporary directories for tests
 
