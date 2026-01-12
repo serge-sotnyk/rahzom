@@ -42,6 +42,8 @@ impl App {
             Dialog::SyncConfirm(_) => self.handle_key_sync_confirm(code),
             Dialog::CancelSyncConfirm => self.handle_key_cancel_sync_confirm(code),
             Dialog::ExclusionsInfo(_) => self.handle_key_exclusions_info(code),
+            Dialog::DiskSpaceWarning(_) => self.handle_key_disk_space_warning(code),
+            Dialog::FileError(_) => self.handle_key_file_error(code),
         }
     }
 
@@ -254,7 +256,7 @@ impl App {
         match code {
             KeyCode::Enter => {
                 self.dialog = Dialog::None;
-                self.start_sync();
+                self.start_sync(false);
             }
             KeyCode::Esc => {
                 self.dialog = Dialog::None;
@@ -285,6 +287,43 @@ impl App {
             }
             KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Enter => {
                 self.create_exclusions_template();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_disk_space_warning(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                // User wants to continue anyway - start sync (skip further disk checks)
+                self.dialog = Dialog::None;
+                self.start_sync(true);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                // User cancelled
+                self.dialog = Dialog::None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_file_error(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                // Retry - just close dialog, current action will be retried
+                self.dialog = Dialog::None;
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                // Skip - mark action as skipped and move to next
+                self.skip_current_sync_action();
+                self.dialog = Dialog::None;
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc => {
+                // Cancel - abort sync
+                if let Some(ref mut syncing) = self.syncing {
+                    syncing.cancel_requested = true;
+                }
+                self.dialog = Dialog::None;
             }
             _ => {}
         }

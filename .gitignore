@@ -25,3 +25,6 @@ target
 
 /target
 .claude/settings.local.json
+
+# Claude Code temp files (cleanup bug on Windows)
+tmpclaude-*-cwd

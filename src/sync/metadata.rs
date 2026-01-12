@@ -27,6 +27,50 @@ pub struct FileAttributes {
     pub windows_hidden: Option<bool>,
 }
 
+impl FileAttributes {
+    /// Reads file attributes from a path
+    #[cfg(windows)]
+    pub fn read_from_path(path: &Path) -> Self {
+        use std::os::windows::fs::MetadataExt;
+
+        match fs::metadata(path) {
+            Ok(metadata) => {
+                let attrs = metadata.file_attributes();
+                const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+                const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+
+                FileAttributes {
+                    unix_mode: None,
+                    windows_readonly: Some((attrs & FILE_ATTRIBUTE_READONLY) != 0),
+                    windows_hidden: Some((attrs & FILE_ATTRIBUTE_HIDDEN) != 0),
+                }
+            }
+            Err(_) => FileAttributes::default(),
+        }
+    }
+
+    /// Reads file attributes from a path
+    #[cfg(unix)]
+    pub fn read_from_path(path: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        match fs::metadata(path) {
+            Ok(metadata) => FileAttributes {
+                unix_mode: Some(metadata.permissions().mode()),
+                windows_readonly: None,
+                windows_hidden: None,
+            },
+            Err(_) => FileAttributes::default(),
+        }
+    }
+
+    /// Reads file attributes from a path
+    #[cfg(not(any(windows, unix)))]
+    pub fn read_from_path(_path: &Path) -> Self {
+        FileAttributes::default()
+    }
+}
+
 /// State of a single file as recorded during last sync
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileState {

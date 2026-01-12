@@ -24,6 +24,8 @@ pub enum ConflictReason {
     ModifiedAndDeleted,
     /// File exists on one side, was deleted on the other (first sync scenario)
     ExistsVsDeleted,
+    /// Files with same name but different case (e.g., File.txt vs file.txt)
+    CaseConflict,
 }
 
 /// Action to perform during synchronization
@@ -160,8 +162,39 @@ pub fn diff(
         })
         .collect();
 
+    // Detect case conflicts: paths that differ only in case
+    let case_conflicts = detect_case_conflicts(&left_files, &right_files);
+    for path in &case_conflicts {
+        // Find file info from both sides
+        let left_entry = left_files.get(path);
+        let right_entry = right_files
+            .iter()
+            .find(|(p, _)| p.to_lowercase() == path.to_lowercase() && p.as_str() != path)
+            .map(|(_, e)| e)
+            .or_else(|| right_files.get(path));
+
+        result.add_action(SyncAction::Conflict {
+            path: PathBuf::from(path),
+            reason: ConflictReason::CaseConflict,
+            left: left_entry.map(|e| FileInfo {
+                size: e.size,
+                mtime: e.mtime,
+                hash: e.hash.clone(),
+            }),
+            right: right_entry.map(|e| FileInfo {
+                size: e.size,
+                mtime: e.mtime,
+                hash: e.hash.clone(),
+            }),
+        });
+    }
+
     // Process left side entries
     for (path, left_entry) in &left_files {
+        // Skip if already handled as case conflict
+        if case_conflicts.iter().any(|p| p.to_lowercase() == path.to_lowercase()) {
+            continue;
+        }
         let right_entry = right_files.get(path);
         let left_prev = left_meta.find_file(path);
         let right_prev = right_meta.find_file(path);
@@ -184,6 +217,10 @@ pub fn diff(
     for (path, right_entry) in &right_files {
         if left_files.contains_key(path) {
             continue; // Already processed
+        }
+        // Skip if already handled as case conflict
+        if case_conflicts.iter().any(|p| p.to_lowercase() == path.to_lowercase()) {
+            continue;
         }
 
         let left_prev = left_meta.find_file(path);
@@ -426,6 +463,70 @@ fn file_changed_since(current: &FileEntry, prev: &super::metadata::FileState) ->
     false
 }
 
+/// Detects paths that differ only in case between left and right sides.
+/// Returns list of paths (from left side) that have case conflicts.
+fn detect_case_conflicts(
+    left_files: &HashMap<String, FileEntry>,
+    right_files: &HashMap<String, FileEntry>,
+) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut conflicts = HashSet::new();
+
+    // Build case-normalized maps
+    let mut left_by_case: HashMap<String, Vec<&str>> = HashMap::new();
+    for path in left_files.keys() {
+        left_by_case
+            .entry(path.to_lowercase())
+            .or_default()
+            .push(path);
+    }
+
+    let mut right_by_case: HashMap<String, Vec<&str>> = HashMap::new();
+    for path in right_files.keys() {
+        right_by_case
+            .entry(path.to_lowercase())
+            .or_default()
+            .push(path);
+    }
+
+    // Check for conflicts within left side (multiple paths with same lowercase)
+    for paths in left_by_case.values() {
+        if paths.len() > 1 {
+            // Multiple files with same case-insensitive name on left
+            for path in paths {
+                conflicts.insert((*path).to_string());
+            }
+        }
+    }
+
+    // Check for conflicts within right side
+    for paths in right_by_case.values() {
+        if paths.len() > 1 {
+            for path in paths {
+                conflicts.insert((*path).to_string());
+            }
+        }
+    }
+
+    // Check for conflicts between sides (same lowercase, different actual case)
+    for (normalized, left_paths) in &left_by_case {
+        if let Some(right_paths) = right_by_case.get(normalized) {
+            // Check if any left path differs from right path
+            for lp in left_paths {
+                for rp in right_paths {
+                    if lp != rp {
+                        // Case conflict between sides
+                        conflicts.insert((*lp).to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    conflicts.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +541,7 @@ mod tests {
             mtime,
             is_dir: false,
             hash: None,
+            attributes: FileAttributes::default(),
         }
     }
 
@@ -450,6 +552,7 @@ mod tests {
             mtime: Utc::now(),
             is_dir: true,
             hash: None,
+            attributes: FileAttributes::default(),
         }
     }
 

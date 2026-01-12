@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use super::exclusions::Exclusions;
+use super::metadata::FileAttributes;
 
 /// Represents a single file or directory entry in the scan result
 #[derive(Debug, Clone)]
@@ -22,6 +23,8 @@ pub struct FileEntry {
     pub is_dir: bool,
     /// SHA-256 hash, computed on demand
     pub hash: Option<String>,
+    /// Platform-specific file attributes
+    pub attributes: FileAttributes,
 }
 
 /// Result of scanning a directory
@@ -98,6 +101,15 @@ pub fn scan_with_exclusions(root: &Path, exclusions: Option<&Exclusions>) -> Res
                             continue;
                         }
                     }
+                }
+
+                // Skip symlinks (not supported)
+                if path.is_symlink() {
+                    skipped.push(SkippedEntry {
+                        path: path.to_path_buf(),
+                        reason: "Symlink (not supported)".to_string(),
+                    });
+                    continue;
                 }
 
                 match process_entry(path, &root) {
@@ -187,6 +199,35 @@ fn should_skip(path: &Path, root: &Path) -> bool {
     false
 }
 
+/// Gets platform-specific file attributes from metadata.
+#[cfg(windows)]
+fn get_file_attributes(metadata: &fs::Metadata) -> FileAttributes {
+    use std::os::windows::fs::MetadataExt;
+    let attrs = metadata.file_attributes();
+    FileAttributes {
+        unix_mode: None,
+        windows_readonly: Some((attrs & 0x1) != 0),  // FILE_ATTRIBUTE_READONLY
+        windows_hidden: Some((attrs & 0x2) != 0),    // FILE_ATTRIBUTE_HIDDEN
+    }
+}
+
+/// Gets platform-specific file attributes from metadata.
+#[cfg(unix)]
+fn get_file_attributes(metadata: &fs::Metadata) -> FileAttributes {
+    use std::os::unix::fs::PermissionsExt;
+    FileAttributes {
+        unix_mode: Some(metadata.permissions().mode()),
+        windows_readonly: None,
+        windows_hidden: None,
+    }
+}
+
+/// Gets platform-specific file attributes from metadata (fallback for other platforms).
+#[cfg(not(any(windows, unix)))]
+fn get_file_attributes(_metadata: &fs::Metadata) -> FileAttributes {
+    FileAttributes::default()
+}
+
 /// Processes a single directory entry into FileEntry.
 fn process_entry(path: &Path, root: &Path) -> Result<FileEntry> {
     let metadata =
@@ -202,6 +243,7 @@ fn process_entry(path: &Path, root: &Path) -> Result<FileEntry> {
         .with_context(|| format!("Failed to get mtime for: {:?}", path))?;
 
     let mtime_utc = system_time_to_utc(mtime);
+    let attributes = get_file_attributes(&metadata);
 
     Ok(FileEntry {
         path: relative_path,
@@ -209,6 +251,7 @@ fn process_entry(path: &Path, root: &Path) -> Result<FileEntry> {
         mtime: mtime_utc,
         is_dir: metadata.is_dir(),
         hash: None,
+        attributes,
     })
 }
 
@@ -428,10 +471,97 @@ mod tests {
             "*.tmp".to_string(),
             "*.log".to_string(),
             ".DS_Store".to_string(),
-        ]).unwrap();
+        ])
+        .unwrap();
         let result = scan_with_exclusions(temp.path(), Some(&excl)).unwrap();
 
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].path, PathBuf::from("file.txt"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = create_test_dir();
+
+        // Create a regular file
+        fs::write(temp.path().join("regular.txt"), "content").unwrap();
+
+        // Create a symlink to the regular file
+        symlink(temp.path().join("regular.txt"), temp.path().join("link.txt")).unwrap();
+
+        let result = scan(temp.path()).unwrap();
+
+        // Should only have the regular file
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, PathBuf::from("regular.txt"));
+
+        // Symlink should be in skipped list
+        assert_eq!(result.skipped.len(), 1);
+        assert!(result.skipped[0].reason.contains("Symlink"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_skips_broken_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = create_test_dir();
+
+        // Create a regular file
+        fs::write(temp.path().join("regular.txt"), "content").unwrap();
+
+        // Create a symlink pointing to a non-existent target
+        symlink(temp.path().join("nonexistent.txt"), temp.path().join("broken_link.txt")).unwrap();
+
+        let result = scan(temp.path()).unwrap();
+
+        // Should only have the regular file
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, PathBuf::from("regular.txt"));
+
+        // Broken symlink should be in skipped list
+        assert_eq!(result.skipped.len(), 1);
+        assert!(result.skipped[0].reason.contains("Symlink"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_scan_handles_long_paths() {
+        let temp = create_test_dir();
+
+        // Create a deeply nested directory structure with path > 260 chars
+        // Each segment is 50 chars, with 6 levels that's 300+ chars
+        let long_segment = "a".repeat(50);
+        let mut deep_path = temp.path().to_path_buf();
+        for _ in 0..6 {
+            deep_path = deep_path.join(&long_segment);
+        }
+
+        // Create the nested directory and a file in it
+        fs::create_dir_all(&deep_path).unwrap();
+        fs::write(deep_path.join("test.txt"), "content").unwrap();
+
+        // Verify the absolute path is > 260 chars
+        let full_path = deep_path.join("test.txt");
+        assert!(
+            full_path.to_string_lossy().len() > 260,
+            "Path should be > 260 chars for this test"
+        );
+
+        // Scan should work without error
+        let result = scan(temp.path()).unwrap();
+
+        // Should have all the directories and the file
+        assert!(!result.entries.is_empty());
+
+        // Should find the file in the deep path
+        let has_test_file = result
+            .entries
+            .iter()
+            .any(|e| e.path.to_string_lossy().contains("test.txt"));
+        assert!(has_test_file, "Should find test.txt in deeply nested path");
     }
 }

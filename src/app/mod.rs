@@ -4,9 +4,9 @@ mod handlers;
 pub mod state;
 
 pub use state::{
-    is_conflict_action, is_skip_action, Dialog, DialogField, ExclusionsInfoDialog,
-    NewProjectDialog, PreviewFilter, PreviewState, PreviewSummary, Screen, SyncCompleteState,
-    SyncConfirmDialog, SyncingState, UserAction,
+    is_conflict_action, is_skip_action, Dialog, DialogField, DiskSpaceWarningDialog,
+    ExclusionsInfoDialog, FileErrorDialog, NewProjectDialog, PreviewFilter, PreviewState,
+    PreviewSummary, Screen, SyncCompleteState, SyncConfirmDialog, SyncingState, UserAction,
 };
 
 use anyhow::Result;
@@ -24,14 +24,18 @@ use std::time::Instant;
 use crate::config::project::{Project, ProjectManager};
 use crate::sync::differ::{diff, SyncAction};
 use crate::sync::exclusions::Exclusions;
-use crate::sync::executor::{ExecutionResult, Executor, ExecutorConfig, FailedAction, FileSnapshot, NoopProgress};
+use crate::sync::executor::{
+    check_disk_space, ExecutionResult, Executor, ExecutorConfig, FailedAction, FileSnapshot,
+    NoopProgress, SyncErrorKind,
+};
 use crate::sync::metadata::{DeletedFile, FileAttributes, FileState, SyncMetadata};
 use crate::sync::scanner::scan_with_exclusions;
 use crate::ui::{
     render_cancel_sync_confirm_dialog, render_create_dir_confirm_dialog,
-    render_delete_confirm_dialog, render_error_dialog, render_exclusions_info_dialog,
-    render_new_project_dialog, render_preview, render_project_list, render_project_view,
-    render_sync_complete, render_sync_confirm_dialog, render_syncing,
+    render_delete_confirm_dialog, render_disk_space_warning_dialog, render_error_dialog,
+    render_exclusions_info_dialog, render_file_error_dialog, render_new_project_dialog,
+    render_preview, render_project_list, render_project_view, render_sync_complete,
+    render_sync_confirm_dialog, render_syncing,
 };
 use chrono::Utc;
 
@@ -268,7 +272,7 @@ impl App {
         });
     }
 
-    fn start_sync(&mut self) {
+    fn start_sync(&mut self, skip_disk_check: bool) {
         let Some(ref preview) = self.preview else {
             return;
         };
@@ -317,14 +321,55 @@ impl App {
             }
         }
 
-        // Calculate total bytes
-        let total_bytes: u64 = actions
+        // Calculate bytes per direction
+        let bytes_to_right: u64 = actions
             .iter()
             .map(|a| match a {
-                SyncAction::CopyToRight { size, .. } | SyncAction::CopyToLeft { size, .. } => *size,
+                SyncAction::CopyToRight { size, .. } => *size,
                 _ => 0,
             })
             .sum();
+
+        let bytes_to_left: u64 = actions
+            .iter()
+            .map(|a| match a {
+                SyncAction::CopyToLeft { size, .. } => *size,
+                _ => 0,
+            })
+            .sum();
+
+        let total_bytes = bytes_to_right + bytes_to_left;
+
+        // Check disk space before starting sync (unless user already confirmed)
+        if !skip_disk_check {
+            if bytes_to_right > 0 {
+                if let Ok(info) = check_disk_space(&project.right_path, bytes_to_right) {
+                    if !info.sufficient {
+                        self.dialog = Dialog::DiskSpaceWarning(DiskSpaceWarningDialog {
+                            is_left: false,
+                            path: project.right_path.clone(),
+                            available: info.available,
+                            required: info.required,
+                        });
+                        return;
+                    }
+                }
+            }
+
+            if bytes_to_left > 0 {
+                if let Ok(info) = check_disk_space(&project.left_path, bytes_to_left) {
+                    if !info.sufficient {
+                        self.dialog = Dialog::DiskSpaceWarning(DiskSpaceWarningDialog {
+                            is_left: true,
+                            path: project.left_path.clone(),
+                            available: info.available,
+                            required: info.required,
+                        });
+                        return;
+                    }
+                }
+            }
+        }
 
         self.syncing = Some(SyncingState {
             total_actions: actions.len(),
@@ -380,7 +425,24 @@ impl App {
         let single_action = vec![action.clone()];
         match executor.execute(single_action, &syncing.snapshots, &mut NoopProgress) {
             Ok(result) => {
-                // Update progress (must be done before moving fields)
+                // Check for recoverable errors that should show dialog
+                if let Some(failed) = result.failed.first() {
+                    if matches!(
+                        failed.kind,
+                        SyncErrorKind::FileLocked | SyncErrorKind::PermissionDenied
+                    ) {
+                        // Show error dialog - don't increment index yet
+                        self.dialog = Dialog::FileError(FileErrorDialog {
+                            path: failed.action.path().clone(),
+                            error: failed.error.clone(),
+                            kind: failed.kind.clone(),
+                            action: failed.action.clone(),
+                        });
+                        return;
+                    }
+                }
+
+                // Update progress
                 syncing.transferred_bytes += result.total_bytes_transferred();
 
                 // Accumulate results
@@ -392,10 +454,32 @@ impl App {
                 syncing.result.failed.push(FailedAction {
                     action,
                     error: e.to_string(),
+                    kind: SyncErrorKind::IoError,
                 });
             }
         }
 
+        syncing.completed_actions += 1;
+        syncing.current_index += 1;
+    }
+
+    /// Skip the current sync action and move to next
+    fn skip_current_sync_action(&mut self) {
+        use crate::sync::executor::SkippedAction;
+
+        let Some(ref mut syncing) = self.syncing else {
+            return;
+        };
+
+        if syncing.current_index >= syncing.actions.len() {
+            return;
+        }
+
+        let action = syncing.actions[syncing.current_index].clone();
+        syncing.result.skipped.push(SkippedAction {
+            action,
+            reason: "Skipped by user".to_string(),
+        });
         syncing.completed_actions += 1;
         syncing.current_index += 1;
     }
@@ -469,13 +553,14 @@ impl App {
                             .and_then(|t| chrono::DateTime::<Utc>::from(t).into())
                             .unwrap_or(now);
                         let size = metadata.len();
+                        let attributes = FileAttributes::read_from_path(&dest_path);
 
                         let file_state = FileState {
                             path: path.to_string_lossy().to_string(),
                             size,
                             mtime,
                             hash: None,
-                            attributes: FileAttributes::default(),
+                            attributes,
                             last_synced: now,
                         };
                         left_meta.upsert_file(file_state.clone());
@@ -492,13 +577,14 @@ impl App {
                             .and_then(|t| chrono::DateTime::<Utc>::from(t).into())
                             .unwrap_or(now);
                         let size = metadata.len();
+                        let attributes = FileAttributes::read_from_path(&dest_path);
 
                         let file_state = FileState {
                             path: path.to_string_lossy().to_string(),
                             size,
                             mtime,
                             hash: None,
-                            attributes: FileAttributes::default(),
+                            attributes,
                             last_synced: now,
                         };
                         left_meta.upsert_file(file_state.clone());
@@ -683,6 +769,12 @@ impl App {
             }
             Dialog::ExclusionsInfo(dialog) => {
                 render_exclusions_info_dialog(frame, dialog);
+            }
+            Dialog::DiskSpaceWarning(dialog) => {
+                render_disk_space_warning_dialog(frame, dialog);
+            }
+            Dialog::FileError(dialog) => {
+                render_file_error_dialog(frame, dialog);
             }
         }
     }

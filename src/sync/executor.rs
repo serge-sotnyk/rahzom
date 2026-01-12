@@ -8,6 +8,123 @@ use chrono::{DateTime, Utc};
 
 use super::differ::SyncAction;
 
+/// Classification of sync errors for specific handling
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncErrorKind {
+    /// File is locked/in use (Windows sharing violation)
+    FileLocked,
+    /// Permission denied
+    PermissionDenied,
+    /// Disk is full
+    DiskFull,
+    /// File was modified during sync
+    FileChanged,
+    /// Path is too long
+    PathTooLong,
+    /// Invalid filename or path
+    InvalidPath,
+    /// File not found
+    NotFound,
+    /// Generic IO error
+    IoError,
+}
+
+impl SyncErrorKind {
+    /// Returns true if this error type is recoverable (user can retry)
+    pub fn is_recoverable(&self) -> bool {
+        matches!(self, Self::FileLocked | Self::DiskFull)
+    }
+
+    /// Returns user-friendly title for this error type
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::FileLocked => "File Locked",
+            Self::PermissionDenied => "Permission Denied",
+            Self::DiskFull => "Disk Full",
+            Self::FileChanged => "File Changed",
+            Self::PathTooLong => "Path Too Long",
+            Self::InvalidPath => "Invalid Path",
+            Self::NotFound => "File Not Found",
+            Self::IoError => "I/O Error",
+        }
+    }
+}
+
+/// Classifies an IO error into SyncErrorKind
+fn classify_io_error(err: &io::Error) -> SyncErrorKind {
+    match err.kind() {
+        io::ErrorKind::PermissionDenied => {
+            // On Windows, check for sharing violation (file locked)
+            #[cfg(windows)]
+            {
+                // ERROR_SHARING_VIOLATION = 32
+                // ERROR_LOCK_VIOLATION = 33
+                if let Some(raw) = err.raw_os_error() {
+                    if raw == 32 || raw == 33 {
+                        return SyncErrorKind::FileLocked;
+                    }
+                }
+            }
+            SyncErrorKind::PermissionDenied
+        }
+        io::ErrorKind::NotFound => SyncErrorKind::NotFound,
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => SyncErrorKind::InvalidPath,
+        // StorageFull is unstable, check raw error on Windows
+        _ => {
+            #[cfg(windows)]
+            {
+                // ERROR_DISK_FULL = 112
+                // ERROR_HANDLE_DISK_FULL = 39
+                if let Some(raw) = err.raw_os_error() {
+                    if raw == 112 || raw == 39 {
+                        return SyncErrorKind::DiskFull;
+                    }
+                }
+            }
+            #[cfg(unix)]
+            {
+                // ENOSPC = 28 on Linux
+                if let Some(raw) = err.raw_os_error() {
+                    if raw == 28 {
+                        return SyncErrorKind::DiskFull;
+                    }
+                }
+            }
+            SyncErrorKind::IoError
+        }
+    }
+}
+
+/// Result of checking disk space
+#[derive(Debug, Clone)]
+pub struct DiskSpaceInfo {
+    /// Available space in bytes
+    pub available: u64,
+    /// Required space in bytes
+    pub required: u64,
+    /// Whether there is enough space
+    pub sufficient: bool,
+}
+
+/// Checks available disk space at the given path.
+///
+/// # Arguments
+/// * `path` - Path to check disk space for (uses the mount point of the path)
+/// * `required_bytes` - Required space in bytes
+///
+/// # Returns
+/// * `DiskSpaceInfo` with available space and whether it's sufficient
+pub fn check_disk_space(path: &Path, required_bytes: u64) -> Result<DiskSpaceInfo> {
+    use fs2::available_space;
+
+    let available = available_space(path)?;
+    Ok(DiskSpaceInfo {
+        available,
+        required: required_bytes,
+        sufficient: available >= required_bytes,
+    })
+}
+
 /// Configuration for the executor
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -41,6 +158,7 @@ pub struct CompletedAction {
 pub struct FailedAction {
     pub action: SyncAction,
     pub error: String,
+    pub kind: SyncErrorKind,
 }
 
 /// A skipped action (e.g., file changed during sync)
@@ -137,9 +255,9 @@ impl Executor {
                     progress.on_file_complete(&action, true);
                     result.skipped.push(SkippedAction { action, reason });
                 }
-                Err(ExecuteError::Failed(error)) => {
+                Err(ExecuteError::Failed(error, kind)) => {
                     progress.on_file_complete(&action, false);
-                    result.failed.push(FailedAction { action, error });
+                    result.failed.push(FailedAction { action, error, kind });
                 }
             }
         }
@@ -261,13 +379,17 @@ impl Executor {
         self.copy_file(src, dst)?;
 
         // Verify copy (size check)
-        let dst_meta = fs::metadata(dst).map_err(|e| ExecuteError::Failed(e.to_string()))?;
+        let dst_meta =
+            fs::metadata(dst).map_err(|e| ExecuteError::from_io(e, "Failed to verify copy"))?;
         if dst_meta.len() != expected_size {
-            return Err(ExecuteError::Failed(format!(
-                "Size mismatch after copy: expected {}, got {}",
-                expected_size,
-                dst_meta.len()
-            )));
+            return Err(ExecuteError::failed(
+                format!(
+                    "Size mismatch after copy: expected {}, got {}",
+                    expected_size,
+                    dst_meta.len()
+                ),
+                SyncErrorKind::IoError,
+            ));
         }
 
         Ok(Some(expected_size))
@@ -283,7 +405,7 @@ impl Executor {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Ok(false); // File was deleted
             }
-            Err(e) => return Err(ExecuteError::Failed(e.to_string())),
+            Err(e) => return Err(ExecuteError::from_io(e, "Failed to verify file")),
         };
 
         // Check size
@@ -294,7 +416,7 @@ impl Executor {
         // Check mtime
         let mtime = metadata
             .modified()
-            .map_err(|e| ExecuteError::Failed(e.to_string()))?;
+            .map_err(|e| ExecuteError::from_io(e, "Failed to get modification time"))?;
         let mtime_utc = system_time_to_utc(mtime);
 
         // Allow FAT32 tolerance for mtime comparison
@@ -310,31 +432,33 @@ impl Executor {
         // Create parent directories
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| ExecuteError::Failed(format!("Failed to create parent dir: {}", e)))?;
+                .map_err(|e| ExecuteError::from_io(e, "Failed to create parent dir"))?;
         }
 
         // Copy file content
-        let src_file = File::open(src)
-            .map_err(|e| ExecuteError::Failed(format!("Failed to open source: {}", e)))?;
+        let src_file =
+            File::open(src).map_err(|e| ExecuteError::from_io(e, "Failed to open source"))?;
         let dst_file = File::create(dst)
-            .map_err(|e| ExecuteError::Failed(format!("Failed to create destination: {}", e)))?;
+            .map_err(|e| ExecuteError::from_io(e, "Failed to create destination"))?;
 
         let mut reader = BufReader::with_capacity(64 * 1024, src_file);
         let mut writer = BufWriter::with_capacity(64 * 1024, dst_file);
 
-        io::copy(&mut reader, &mut writer)
-            .map_err(|e| ExecuteError::Failed(format!("Failed to copy: {}", e)))?;
+        io::copy(&mut reader, &mut writer).map_err(|e| ExecuteError::from_io(e, "Failed to copy"))?;
 
         writer
             .flush()
-            .map_err(|e| ExecuteError::Failed(format!("Failed to flush: {}", e)))?;
+            .map_err(|e| ExecuteError::from_io(e, "Failed to flush"))?;
 
         // Preserve mtime
-        let src_meta = fs::metadata(src)
-            .map_err(|e| ExecuteError::Failed(format!("Failed to get metadata: {}", e)))?;
+        let src_meta =
+            fs::metadata(src).map_err(|e| ExecuteError::from_io(e, "Failed to get metadata"))?;
         if let Ok(mtime) = src_meta.modified() {
             let _ = set_file_mtime(dst, mtime);
         }
+
+        // Preserve file attributes (readonly, hidden on Windows)
+        let _ = set_file_attributes(dst, src);
 
         Ok(())
     }
@@ -352,14 +476,14 @@ impl Executor {
             } else {
                 fs::remove_file(path)
             }
-            .map_err(|e| ExecuteError::Failed(format!("Failed to delete: {}", e)))
+            .map_err(|e| ExecuteError::from_io(e, "Failed to delete"))
         }
     }
 
     fn soft_delete(&self, path: &Path, root: &Path) -> std::result::Result<(), ExecuteError> {
         let trash_dir = root.join(METADATA_DIR).join(TRASH_DIR);
         fs::create_dir_all(&trash_dir)
-            .map_err(|e| ExecuteError::Failed(format!("Failed to create trash dir: {}", e)))?;
+            .map_err(|e| ExecuteError::from_io(e, "Failed to create trash dir"))?;
 
         let filename = path
             .file_name()
@@ -370,14 +494,13 @@ impl Executor {
         let trash_name = format!("{}.{}", filename, timestamp);
         let trash_path = trash_dir.join(trash_name);
 
-        fs::rename(path, &trash_path)
-            .map_err(|e| ExecuteError::Failed(format!("Failed to move to trash: {}", e)))
+        fs::rename(path, &trash_path).map_err(|e| ExecuteError::from_io(e, "Failed to move to trash"))
     }
 
     fn create_backup(&self, path: &Path, root: &Path) -> std::result::Result<(), ExecuteError> {
         let backup_dir = root.join(METADATA_DIR).join(BACKUP_DIR);
         fs::create_dir_all(&backup_dir)
-            .map_err(|e| ExecuteError::Failed(format!("Failed to create backup dir: {}", e)))?;
+            .map_err(|e| ExecuteError::from_io(e, "Failed to create backup dir"))?;
 
         let filename = path
             .file_name()
@@ -389,8 +512,7 @@ impl Executor {
         let backup_path = backup_dir.join(&backup_name);
 
         // Copy to backup
-        fs::copy(path, &backup_path)
-            .map_err(|e| ExecuteError::Failed(format!("Failed to create backup: {}", e)))?;
+        fs::copy(path, &backup_path).map_err(|e| ExecuteError::from_io(e, "Failed to create backup"))?;
 
         // Rotate old backups
         self.rotate_backups(&backup_dir, &filename)?;
@@ -405,7 +527,7 @@ impl Executor {
     ) -> std::result::Result<(), ExecuteError> {
         let prefix = format!("{}.", filename);
         let mut backups: Vec<_> = fs::read_dir(backup_dir)
-            .map_err(|e| ExecuteError::Failed(format!("Failed to read backup dir: {}", e)))?
+            .map_err(|e| ExecuteError::from_io(e, "Failed to read backup dir"))?
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
             .collect();
@@ -422,15 +544,27 @@ impl Executor {
     }
 
     fn create_dir(&self, path: &Path) -> std::result::Result<(), ExecuteError> {
-        fs::create_dir_all(path)
-            .map_err(|e| ExecuteError::Failed(format!("Failed to create directory: {}", e)))
+        fs::create_dir_all(path).map_err(|e| ExecuteError::from_io(e, "Failed to create directory"))
     }
 }
 
 #[derive(Debug)]
 enum ExecuteError {
     Skipped(String),
-    Failed(String),
+    Failed(String, SyncErrorKind),
+}
+
+impl ExecuteError {
+    /// Create a Failed error from an io::Error with automatic classification
+    fn from_io(err: io::Error, context: &str) -> Self {
+        let kind = classify_io_error(&err);
+        Self::Failed(format!("{}: {}", context, err), kind)
+    }
+
+    /// Create a Failed error with a specific kind
+    fn failed(msg: String, kind: SyncErrorKind) -> Self {
+        Self::Failed(msg, kind)
+    }
 }
 
 fn system_time_to_utc(time: SystemTime) -> DateTime<Utc> {
@@ -480,6 +614,54 @@ fn set_file_mtime(path: &Path, mtime: SystemTime) -> io::Result<()> {
     // On Unix, we'd use filetime crate or libc
     // For now, just ignore mtime setting on non-Windows
     let _ = (path, mtime);
+    Ok(())
+}
+
+/// Sets Windows file attributes (readonly, hidden) on the destination file
+#[cfg(windows)]
+fn set_file_attributes(path: &Path, src_path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+
+    // Read attributes from source
+    let src_meta = fs::metadata(src_path)?;
+    let src_attrs = src_meta.file_attributes();
+
+    // Only apply if source has readonly or hidden attributes
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const ATTRS_MASK: u32 = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN;
+
+    let attrs_to_apply = src_attrs & ATTRS_MASK;
+    if attrs_to_apply == 0 {
+        return Ok(()); // No special attributes to apply
+    }
+
+    // Read current destination attributes and merge
+    let dst_meta = fs::metadata(path)?;
+    let dst_attrs = dst_meta.file_attributes();
+    let new_attrs = (dst_attrs & !ATTRS_MASK) | attrs_to_apply;
+
+    // Convert path to wide string for Windows API
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+    let result = unsafe {
+        windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
+            wide_path.as_ptr(),
+            new_attrs,
+        )
+    };
+
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn set_file_attributes(_path: &Path, _src_path: &Path) -> io::Result<()> {
+    // On Unix, permissions would be handled differently
     Ok(())
 }
 
@@ -812,5 +994,63 @@ mod tests {
         assert_eq!(result.completed.len(), 0);
         assert_eq!(result.skipped.len(), 1);
         assert!(!right.path().join("test.txt").exists());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_copy_preserves_windows_attributes() {
+        use std::os::windows::fs::MetadataExt;
+        use std::process::Command;
+
+        let (left, right) = create_test_dirs();
+
+        // Create source file
+        let src_path = left.path().join("test.txt");
+        fs::write(&src_path, "test content").unwrap();
+
+        // Set readonly + hidden attributes using attrib command
+        let status = Command::new("attrib")
+            .args(["+R", "+H", src_path.to_str().unwrap()])
+            .status()
+            .expect("Failed to run attrib");
+        assert!(status.success(), "attrib command failed");
+
+        // Verify source has attributes set
+        let src_meta = fs::metadata(&src_path).unwrap();
+        let src_attrs = src_meta.file_attributes();
+        assert!((src_attrs & 0x1) != 0, "Source should be readonly");
+        assert!((src_attrs & 0x2) != 0, "Source should be hidden");
+
+        let executor = Executor::new(
+            left.path().to_path_buf(),
+            right.path().to_path_buf(),
+            ExecutorConfig::default(),
+        );
+
+        let actions = vec![SyncAction::CopyToRight {
+            path: PathBuf::from("test.txt"),
+            size: 12,
+        }];
+
+        let result = executor
+            .execute(actions, &HashMap::new(), &mut NoopProgress)
+            .unwrap();
+
+        assert_eq!(result.completed.len(), 1);
+        assert!(right.path().join("test.txt").exists());
+
+        // Verify destination has same attributes
+        let dst_meta = fs::metadata(right.path().join("test.txt")).unwrap();
+        let dst_attrs = dst_meta.file_attributes();
+        assert!(
+            (dst_attrs & 0x1) != 0,
+            "Destination should be readonly (attrs: {:#x})",
+            dst_attrs
+        );
+        assert!(
+            (dst_attrs & 0x2) != 0,
+            "Destination should be hidden (attrs: {:#x})",
+            dst_attrs
+        );
     }
 }

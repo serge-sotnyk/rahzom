@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::sync::differ::{DiffResult, SyncAction};
 use crate::sync::executor::{
-    CompletedAction, ExecutionResult, FailedAction, FileSnapshot, SkippedAction,
+    CompletedAction, ExecutionResult, FailedAction, FileSnapshot, SkippedAction, SyncErrorKind,
 };
 use crate::sync::scanner::ScanResult;
 
@@ -32,6 +32,34 @@ pub enum Dialog {
     SyncConfirm(SyncConfirmDialog),
     CancelSyncConfirm,
     ExclusionsInfo(ExclusionsInfoDialog),
+    DiskSpaceWarning(DiskSpaceWarningDialog),
+    FileError(FileErrorDialog),
+}
+
+/// Disk space warning dialog
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiskSpaceWarningDialog {
+    /// Which side has insufficient space (true = left, false = right)
+    pub is_left: bool,
+    /// Path being checked
+    pub path: PathBuf,
+    /// Available space in bytes
+    pub available: u64,
+    /// Required space in bytes
+    pub required: u64,
+}
+
+/// File error dialog (locked file, permission denied)
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileErrorDialog {
+    /// Path to the file that failed
+    pub path: PathBuf,
+    /// Error message
+    pub error: String,
+    /// Error classification
+    pub kind: SyncErrorKind,
+    /// The action that failed (for retry)
+    pub action: SyncAction,
 }
 
 /// Filter mode for preview

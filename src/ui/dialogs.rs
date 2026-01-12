@@ -8,7 +8,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{DialogField, ExclusionsInfoDialog, NewProjectDialog, SyncConfirmDialog};
+use crate::app::{
+    DialogField, DiskSpaceWarningDialog, ExclusionsInfoDialog, FileErrorDialog, NewProjectDialog,
+    SyncConfirmDialog,
+};
+use crate::sync::executor::SyncErrorKind;
 use crate::ui::{centered_rect, format_bytes};
 
 /// Renders new project dialog
@@ -340,6 +344,107 @@ pub fn render_exclusions_info_dialog(frame: &mut Frame, dialog: &ExclusionsInfoD
         text.push(Line::from(vec![
             Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(" Close"),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
+}
+
+/// Renders disk space warning dialog
+pub fn render_disk_space_warning_dialog(frame: &mut Frame, dialog: &DiskSpaceWarningDialog) {
+    let area = centered_rect(60, 11, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Low Disk Space ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let side = if dialog.is_left { "Left" } else { "Right" };
+    let text = vec![
+        Line::from(""),
+        Line::from(format!("{} destination may not have", side)),
+        Line::from("enough space:"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Required:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format_bytes(dialog.required), Style::default().fg(Color::Red)),
+        ]),
+        Line::from(vec![
+            Span::styled("Available: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_bytes(dialog.available),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Y ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+            Span::raw(" Continue anyway  "),
+            Span::styled(" N ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
+}
+
+/// Renders file error dialog (locked file, permission denied)
+pub fn render_file_error_dialog(frame: &mut Frame, dialog: &FileErrorDialog) {
+    let area = centered_rect(65, 11, frame.area());
+    frame.render_widget(Clear, area);
+
+    let (title, title_color) = match dialog.kind {
+        SyncErrorKind::FileLocked => (" File Locked ", Color::Yellow),
+        SyncErrorKind::PermissionDenied => (" Permission Denied ", Color::Red),
+        _ => (" Error ", Color::Red),
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(title_color));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let path_str = dialog.path.display().to_string();
+    let show_retry = matches!(dialog.kind, SyncErrorKind::FileLocked);
+
+    let mut text = vec![
+        Line::from(""),
+        Line::from("Cannot access file:"),
+        Line::from(Span::styled(
+            if path_str.len() > 55 {
+                format!("...{}", &path_str[path_str.len() - 52..])
+            } else {
+                path_str
+            },
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(&dialog.error, Style::default().fg(Color::Red))),
+        Line::from(""),
+    ];
+
+    if show_retry {
+        text.push(Line::from(vec![
+            Span::styled(" R ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+            Span::raw(" Retry  "),
+            Span::styled(" S ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" Skip  "),
+            Span::styled(" C ", Style::default().fg(Color::Black).bg(Color::Red)),
+            Span::raw(" Cancel"),
+        ]));
+    } else {
+        text.push(Line::from(vec![
+            Span::styled(" S ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" Skip  "),
+            Span::styled(" C ", Style::default().fg(Color::Black).bg(Color::Red)),
+            Span::raw(" Cancel"),
         ]));
     }
 

@@ -254,6 +254,7 @@ pub fn render_action_item(
                 ConflictReason::BothModified => "both modified",
                 ConflictReason::ModifiedAndDeleted => "mod vs del",
                 ConflictReason::ExistsVsDeleted => "exists vs del",
+                ConflictReason::CaseConflict => "case conflict",
             };
             (
                 "⚠",
