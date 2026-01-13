@@ -194,8 +194,12 @@ impl SyncMetadata {
         self.deleted.push(file);
     }
 
-    /// Removes entries from deleted list older than retention period
+    /// Removes entries from deleted list older than retention period.
+    /// If retention_days is 0, cleanup is disabled (keep forever).
     pub fn cleanup_deleted(&mut self, retention_days: i64) {
+        if retention_days == 0 {
+            return; // 0 means keep forever
+        }
         let cutoff = Utc::now() - Duration::days(retention_days);
         self.deleted.retain(|d| d.deleted_at > cutoff);
     }

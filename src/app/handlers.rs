@@ -4,7 +4,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use std::time::{Duration, Instant};
 
-use super::{App, Dialog, NewProjectDialog, Screen, UserAction};
+use super::{App, Dialog, NewProjectDialog, Screen, SettingsDialog, UserAction};
 
 impl App {
     /// Handle input events
@@ -44,6 +44,7 @@ impl App {
             Dialog::ExclusionsInfo(_) => self.handle_key_exclusions_info(code),
             Dialog::DiskSpaceWarning(_) => self.handle_key_disk_space_warning(code),
             Dialog::FileError(_) => self.handle_key_file_error(code),
+            Dialog::ProjectSettings(_) => self.handle_key_settings(code),
         }
     }
 
@@ -110,6 +111,9 @@ impl App {
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 self.run_analyze();
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.show_settings_dialog();
             }
             _ => {}
         }
@@ -326,6 +330,72 @@ impl App {
                 self.dialog = Dialog::None;
             }
             _ => {}
+        }
+    }
+
+    fn handle_key_settings(&mut self, code: KeyCode) {
+        if let Dialog::ProjectSettings(ref mut dialog) = self.dialog {
+            match code {
+                KeyCode::Esc => {
+                    self.dialog = Dialog::None;
+                }
+                KeyCode::Tab => {
+                    dialog.next_field();
+                }
+                KeyCode::BackTab => {
+                    dialog.prev_field();
+                }
+                KeyCode::Enter => {
+                    self.save_settings();
+                }
+                KeyCode::Backspace => {
+                    if let Some(value) = dialog.focused_value_mut() {
+                        value.pop();
+                        dialog.error = None;
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    dialog.toggle_focused_bool();
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    if let Some(value) = dialog.focused_value_mut() {
+                        value.push(c);
+                        dialog.error = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn show_settings_dialog(&mut self) {
+        if let Some(ref project) = self.current_project {
+            self.dialog = Dialog::ProjectSettings(SettingsDialog::from_settings(&project.settings));
+        }
+    }
+
+    fn save_settings(&mut self) {
+        if let Dialog::ProjectSettings(ref dialog) = self.dialog {
+            match dialog.to_settings() {
+                Ok(new_settings) => {
+                    if let Some(ref mut project) = self.current_project {
+                        project.settings = new_settings;
+                        // Save project to disk
+                        if let Some(ref pm) = self.project_manager {
+                            if let Err(e) = pm.save_project(project) {
+                                self.dialog = Dialog::Error(format!("Failed to save: {}", e));
+                                return;
+                            }
+                        }
+                    }
+                    self.dialog = Dialog::None;
+                }
+                Err(e) => {
+                    if let Dialog::ProjectSettings(ref mut d) = self.dialog {
+                        d.error = Some(e);
+                    }
+                }
+            }
         }
     }
 

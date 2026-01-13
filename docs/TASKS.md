@@ -24,9 +24,10 @@
 | 10b | Simplify Exclusions | 0.25 day | Move to .rahzomignore, opt-in |
 | 10c | Fix Direction Change | 0.1 day | Delete action for one-sided files |
 | 11 | Error Handling & Edge Cases | 1 day | Locked files, long paths, etc. |
-| 12 | Polish & Integration Tests | 1 day | End-to-end tests, README |
+| 12 | Project Settings | 0.5 day | Configurable backup/retention settings |
+| 13 | Polish & Integration Tests | 1 day | End-to-end tests, README |
 
-**Total estimate: 8-12 days of focused work**
+**Total estimate: 8-13 days of focused work**
 
 ---
 
@@ -923,40 +924,90 @@ Arrows now mean "which side is source of truth":
 
 ---
 
-## Stage 12: Polish & Integration Tests
+## Stage 12: Project Settings
+
+**Goal**: Configurable project settings via TUI dialog.
+
+**Version**: 0.12.1 → 0.13.0 (feature)
+
+### Tasks
+
+#### 12.1 Add SettingsDialog struct
+- Add `SettingsField` enum and `SettingsDialog` struct to `state.rs`
+- Add `Dialog::ProjectSettings` variant
+- Implement `from_settings()` and `to_settings()` methods
+
+#### 12.2 Add dialog rendering
+- Implement `render_settings_dialog()` in `dialogs.rs`
+- Fields: backup_versions, deleted_retention_days, soft_delete, verify_hash
+- Tab navigation, Space to toggle booleans
+
+#### 12.3 Add keyboard handler
+- Add `handle_key_settings()` method
+- Number input for numeric fields
+- Space toggle for boolean fields
+- Enter to save, Esc to cancel
+
+#### 12.4 Add [C] key to ProjectView
+- Open settings dialog from ProjectView screen
+- Update footer hints
+
+#### 12.5 Wire up ExecutorConfig
+- Connect `project.settings` to `ExecutorConfig` in sync execution
+- Settings now actually affect backup behavior
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/app/state.rs` | SettingsField, SettingsDialog, Dialog variant |
+| `src/ui/dialogs.rs` | render_settings_dialog() |
+| `src/app/handlers.rs` | [C] key, handle_key_settings(), save_settings() |
+| `src/app/mod.rs` | Dialog rendering, ExecutorConfig wiring, footer hint |
+
+### Definition of Done
+- [x] Settings dialog opens with [C] key
+- [x] Can edit all 4 settings
+- [x] Validation works (1-100, 1-365)
+- [x] Settings persist to project file
+- [x] ExecutorConfig uses project settings
+
+---
+
+## Stage 13: Polish & Integration Tests
 
 **Goal**: End-to-end testing, documentation, release preparation.
 
 ### Tasks
 
-#### 12.1 Integration tests
+#### 13.1 Integration tests
 - Full cycle: create project → analyze → sync → verify
 - Test with generated complex folder structure
 - Test conflict resolution flows
 - Test error recovery
 
-#### 12.2 Cross-platform testing
+#### 13.2 Cross-platform testing
 - Test on Windows (especially long paths)
 - Test on Linux
 - Test on macOS (if available)
 
-#### 12.3 Performance testing
+#### 13.3 Performance testing
 - Scan 50k files, measure time
 - Sync 1000 files, measure time
 - Profile and optimize if needed
 
-#### 12.4 README
+#### 13.4 README
 - Installation instructions
 - Quick start guide
 - Screenshots
 - Known limitations
 
-#### 12.5 Release build
+#### 13.5 Release build
 - `cargo build --release`
 - Test release binary
 - Strip symbols for smaller size (optional)
 
-#### 12.6 GitHub release (optional)
+#### 13.6 GitHub release (optional)
 - Tag version
 - Build binaries for all platforms via CI
 - Create release with binaries

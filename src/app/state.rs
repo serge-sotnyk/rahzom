@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::config::project::ProjectSettings;
 use crate::sync::differ::{DiffResult, SyncAction};
 use crate::sync::executor::{
     CompletedAction, ExecutionResult, FailedAction, FileSnapshot, SkippedAction, SyncErrorKind,
@@ -34,6 +35,7 @@ pub enum Dialog {
     ExclusionsInfo(ExclusionsInfoDialog),
     DiskSpaceWarning(DiskSpaceWarningDialog),
     FileError(FileErrorDialog),
+    ProjectSettings(SettingsDialog),
 }
 
 /// Disk space warning dialog
@@ -167,6 +169,98 @@ pub struct ExclusionsInfoDialog {
     pub right_exists: bool,
     pub left_count: usize,
     pub right_count: usize,
+}
+
+/// Settings dialog field selector
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsField {
+    BackupVersions,
+    DeletedRetentionDays,
+    SoftDelete,
+    VerifyHash,
+}
+
+/// Project settings dialog state
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsDialog {
+    pub backup_versions: String,
+    pub deleted_retention_days: String,
+    pub soft_delete: bool,
+    pub verify_hash: bool,
+    pub focused_field: SettingsField,
+    pub error: Option<String>,
+}
+
+impl SettingsDialog {
+    pub fn from_settings(settings: &ProjectSettings) -> Self {
+        Self {
+            backup_versions: settings.backup_versions.to_string(),
+            deleted_retention_days: settings.deleted_retention_days.to_string(),
+            soft_delete: settings.soft_delete,
+            verify_hash: settings.verify_hash,
+            focused_field: SettingsField::BackupVersions,
+            error: None,
+        }
+    }
+
+    pub fn to_settings(&self) -> Result<ProjectSettings, String> {
+        let backup_versions = self
+            .backup_versions
+            .parse::<usize>()
+            .map_err(|_| "Invalid backup versions")?;
+        if backup_versions == 0 || backup_versions > 100 {
+            return Err("Backup versions must be 1-100".to_string());
+        }
+
+        let deleted_retention_days = self
+            .deleted_retention_days
+            .parse::<u32>()
+            .map_err(|_| "Invalid retention days")?;
+        if deleted_retention_days > 365 {
+            return Err("Retention days must be 0-365 (0=off)".to_string());
+        }
+
+        Ok(ProjectSettings {
+            backup_versions,
+            deleted_retention_days,
+            soft_delete: self.soft_delete,
+            verify_hash: self.verify_hash,
+        })
+    }
+
+    pub fn focused_value_mut(&mut self) -> Option<&mut String> {
+        match self.focused_field {
+            SettingsField::BackupVersions => Some(&mut self.backup_versions),
+            SettingsField::DeletedRetentionDays => Some(&mut self.deleted_retention_days),
+            SettingsField::SoftDelete | SettingsField::VerifyHash => None,
+        }
+    }
+
+    pub fn toggle_focused_bool(&mut self) {
+        match self.focused_field {
+            SettingsField::SoftDelete => self.soft_delete = !self.soft_delete,
+            SettingsField::VerifyHash => self.verify_hash = !self.verify_hash,
+            _ => {}
+        }
+    }
+
+    pub fn next_field(&mut self) {
+        self.focused_field = match self.focused_field {
+            SettingsField::BackupVersions => SettingsField::DeletedRetentionDays,
+            SettingsField::DeletedRetentionDays => SettingsField::SoftDelete,
+            SettingsField::SoftDelete => SettingsField::VerifyHash,
+            SettingsField::VerifyHash => SettingsField::BackupVersions,
+        };
+    }
+
+    pub fn prev_field(&mut self) {
+        self.focused_field = match self.focused_field {
+            SettingsField::BackupVersions => SettingsField::VerifyHash,
+            SettingsField::DeletedRetentionDays => SettingsField::BackupVersions,
+            SettingsField::SoftDelete => SettingsField::DeletedRetentionDays,
+            SettingsField::VerifyHash => SettingsField::SoftDelete,
+        };
+    }
 }
 
 /// Action that user can modify

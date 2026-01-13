@@ -6,7 +6,8 @@ pub mod state;
 pub use state::{
     is_conflict_action, is_skip_action, Dialog, DialogField, DiskSpaceWarningDialog,
     ExclusionsInfoDialog, FileErrorDialog, NewProjectDialog, PreviewFilter, PreviewState,
-    PreviewSummary, Screen, SyncCompleteState, SyncConfirmDialog, SyncingState, UserAction,
+    PreviewSummary, Screen, SettingsDialog, SettingsField, SyncCompleteState, SyncConfirmDialog,
+    SyncingState, UserAction,
 };
 
 use anyhow::Result;
@@ -34,8 +35,8 @@ use crate::ui::{
     render_cancel_sync_confirm_dialog, render_create_dir_confirm_dialog,
     render_delete_confirm_dialog, render_disk_space_warning_dialog, render_error_dialog,
     render_exclusions_info_dialog, render_file_error_dialog, render_new_project_dialog,
-    render_preview, render_project_list, render_project_view, render_sync_complete,
-    render_sync_confirm_dialog, render_syncing,
+    render_preview, render_project_list, render_project_view, render_settings_dialog,
+    render_sync_complete, render_sync_confirm_dialog, render_syncing,
 };
 use chrono::Utc;
 
@@ -233,9 +234,12 @@ impl App {
             }
         };
 
-        // Load metadata
-        let left_meta = SyncMetadata::load(&project.left_path).unwrap_or_default();
-        let right_meta = SyncMetadata::load(&project.right_path).unwrap_or_default();
+        // Load metadata with project's retention setting
+        let retention = project.settings.deleted_retention_days as i64;
+        let left_meta =
+            SyncMetadata::load_with_retention(&project.left_path, retention).unwrap_or_default();
+        let right_meta =
+            SyncMetadata::load_with_retention(&project.right_path, retention).unwrap_or_default();
 
         // Run diff
         let diff_result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
@@ -414,11 +418,16 @@ impl App {
         // Update current file display
         syncing.current_file = action.path().clone();
 
-        // Create executor for this action
+        // Create executor for this action using project settings
+        let config = ExecutorConfig {
+            backup_enabled: true,
+            backup_versions: project.settings.backup_versions,
+            soft_delete: project.settings.soft_delete,
+        };
         let executor = Executor::new(
             project.left_path.clone(),
             project.right_path.clone(),
-            ExecutorConfig::default(),
+            config,
         );
 
         // Execute single action
@@ -534,9 +543,12 @@ impl App {
             return Ok(());
         };
 
-        // Load existing metadata
-        let mut left_meta = SyncMetadata::load(&project.left_path).unwrap_or_default();
-        let mut right_meta = SyncMetadata::load(&project.right_path).unwrap_or_default();
+        // Load existing metadata with project's retention setting
+        let retention = project.settings.deleted_retention_days as i64;
+        let mut left_meta =
+            SyncMetadata::load_with_retention(&project.left_path, retention).unwrap_or_default();
+        let mut right_meta =
+            SyncMetadata::load_with_retention(&project.right_path, retention).unwrap_or_default();
 
         let now = Utc::now();
 
@@ -776,6 +788,9 @@ impl App {
             Dialog::FileError(dialog) => {
                 render_file_error_dialog(frame, dialog);
             }
+            Dialog::ProjectSettings(dialog) => {
+                render_settings_dialog(frame, dialog);
+            }
         }
     }
 
@@ -881,6 +896,8 @@ impl App {
                 vec![
                     Span::styled(" A ", Style::default().fg(Color::Black).bg(Color::Green)),
                     Span::raw(" Analyze  "),
+                    Span::styled(" C ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" Config  "),
                     Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     Span::raw(" Back  "),
                     Span::styled(" Q ", Style::default().fg(Color::Black).bg(Color::Gray)),

@@ -10,7 +10,7 @@ use ratatui::Frame;
 
 use crate::app::{
     DialogField, DiskSpaceWarningDialog, ExclusionsInfoDialog, FileErrorDialog, NewProjectDialog,
-    SyncConfirmDialog,
+    SettingsDialog, SettingsField, SyncConfirmDialog,
 };
 use crate::sync::executor::SyncErrorKind;
 use crate::ui::{centered_rect, format_bytes};
@@ -449,4 +449,125 @@ pub fn render_file_error_dialog(frame: &mut Frame, dialog: &FileErrorDialog) {
     }
 
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
+}
+
+/// Renders project settings dialog
+pub fn render_settings_dialog(frame: &mut Frame, dialog: &SettingsDialog) {
+    let area = centered_rect(55, 14, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Project Settings ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1), // spacing
+        Constraint::Length(1), // backup versions
+        Constraint::Length(1), // spacing
+        Constraint::Length(1), // retention days
+        Constraint::Length(1), // spacing
+        Constraint::Length(1), // soft delete
+        Constraint::Length(1), // spacing
+        Constraint::Length(1), // verify hash
+        Constraint::Length(1), // spacing
+        Constraint::Min(1),    // hints/error
+    ])
+    .split(inner.inner(Margin::new(2, 0)));
+
+    // Backup versions field
+    let backup_style = if dialog.focused_field == SettingsField::BackupVersions {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let backup_line = Line::from(vec![
+        Span::styled("Backup versions:    ", backup_style),
+        Span::raw(&dialog.backup_versions),
+        if dialog.focused_field == SettingsField::BackupVersions {
+            Span::styled("▌", Style::default().fg(Color::White))
+        } else {
+            Span::raw("")
+        },
+        Span::styled(" (1-100)", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(backup_line), chunks[1]);
+
+    // Retention days field
+    let retention_style = if dialog.focused_field == SettingsField::DeletedRetentionDays {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let retention_line = Line::from(vec![
+        Span::styled("Deleted retention:  ", retention_style),
+        Span::raw(&dialog.deleted_retention_days),
+        if dialog.focused_field == SettingsField::DeletedRetentionDays {
+            Span::styled("▌", Style::default().fg(Color::White))
+        } else {
+            Span::raw("")
+        },
+        Span::styled(" days (0=off)", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(retention_line), chunks[3]);
+
+    // Soft delete toggle
+    let soft_style = if dialog.focused_field == SettingsField::SoftDelete {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let soft_value = if dialog.soft_delete { "Yes" } else { "No " };
+    let soft_line = Line::from(vec![
+        Span::styled("Soft delete:        ", soft_style),
+        Span::styled(
+            format!("[{}]", soft_value),
+            if dialog.soft_delete {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Red)
+            },
+        ),
+        Span::styled(" (Space to toggle)", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(soft_line), chunks[5]);
+
+    // Verify hash toggle
+    let hash_style = if dialog.focused_field == SettingsField::VerifyHash {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let hash_value = if dialog.verify_hash { "Yes" } else { "No " };
+    let hash_line = Line::from(vec![
+        Span::styled("Verify hash:        ", hash_style),
+        Span::styled(
+            format!("[{}]", hash_value),
+            if dialog.verify_hash {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Red)
+            },
+        ),
+        Span::styled(" (Space to toggle)", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(hash_line), chunks[7]);
+
+    // Hints or error
+    let hint = if let Some(ref error) = dialog.error {
+        Line::from(Span::styled(error, Style::default().fg(Color::Red)))
+    } else {
+        Line::from(vec![
+            Span::styled(" Tab ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" Next  "),
+            Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::raw(" Save  "),
+            Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" Cancel"),
+        ])
+    };
+    frame.render_widget(Paragraph::new(hint), chunks[9]);
 }
