@@ -226,7 +226,8 @@ impl App {
             }
         };
 
-        let right_scan = match scan_with_exclusions(&project.right_path, right_exclusions.as_ref()) {
+        let right_scan = match scan_with_exclusions(&project.right_path, right_exclusions.as_ref())
+        {
             Ok(s) => s,
             Err(e) => {
                 self.dialog = Dialog::Error(format!("Failed to scan right: {}", e));

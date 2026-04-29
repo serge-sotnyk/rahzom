@@ -206,8 +206,8 @@ fn get_file_attributes(metadata: &fs::Metadata) -> FileAttributes {
     let attrs = metadata.file_attributes();
     FileAttributes {
         unix_mode: None,
-        windows_readonly: Some((attrs & 0x1) != 0),  // FILE_ATTRIBUTE_READONLY
-        windows_hidden: Some((attrs & 0x2) != 0),    // FILE_ATTRIBUTE_HIDDEN
+        windows_readonly: Some((attrs & 0x1) != 0), // FILE_ATTRIBUTE_READONLY
+        windows_hidden: Some((attrs & 0x2) != 0),   // FILE_ATTRIBUTE_HIDDEN
     }
 }
 
@@ -298,11 +298,11 @@ mod tests {
         assert!(result
             .entries
             .iter()
-            .any(|e| e.path == PathBuf::from("file1.txt")));
+            .any(|e| e.path.to_str() == Some("file1.txt")));
         assert!(result
             .entries
             .iter()
-            .any(|e| e.path == PathBuf::from("file2.txt")));
+            .any(|e| e.path.to_str() == Some("file2.txt")));
     }
 
     #[test]
@@ -416,9 +416,18 @@ mod tests {
         let result = scan_with_exclusions(temp.path(), Some(&excl)).unwrap();
 
         assert_eq!(result.entries.len(), 2);
-        assert!(result.entries.iter().any(|e| e.path == PathBuf::from("keep.txt")));
-        assert!(result.entries.iter().any(|e| e.path == PathBuf::from("also_keep.rs")));
-        assert!(!result.entries.iter().any(|e| e.path == PathBuf::from("exclude.tmp")));
+        assert!(result
+            .entries
+            .iter()
+            .any(|e| e.path.to_str() == Some("keep.txt")));
+        assert!(result
+            .entries
+            .iter()
+            .any(|e| e.path.to_str() == Some("also_keep.rs")));
+        assert!(!result
+            .entries
+            .iter()
+            .any(|e| e.path.to_str() == Some("exclude.tmp")));
 
         // Excluded file should be in skipped list
         assert!(result.skipped.iter().any(|s| s.reason.contains("Excluded")));
@@ -438,11 +447,20 @@ mod tests {
 
         // Should only have src and src/main.rs
         assert_eq!(result.entries.len(), 2);
-        assert!(result.entries.iter().any(|e| e.path == PathBuf::from("src")));
-        assert!(result.entries.iter().any(|e| e.path == PathBuf::from("src/main.rs") || e.path == PathBuf::from("src\\main.rs")));
+        assert!(result
+            .entries
+            .iter()
+            .any(|e| e.path.to_str() == Some("src")));
+        assert!(result.entries.iter().any(|e| {
+            let s = e.path.to_str();
+            s == Some("src/main.rs") || s == Some("src\\main.rs")
+        }));
 
         // node_modules directory and its contents should not be in entries
-        assert!(!result.entries.iter().any(|e| e.path.to_string_lossy().contains("node_modules")));
+        assert!(!result
+            .entries
+            .iter()
+            .any(|e| e.path.to_string_lossy().contains("node_modules")));
     }
 
     #[test]
@@ -490,7 +508,11 @@ mod tests {
         fs::write(temp.path().join("regular.txt"), "content").unwrap();
 
         // Create a symlink to the regular file
-        symlink(temp.path().join("regular.txt"), temp.path().join("link.txt")).unwrap();
+        symlink(
+            temp.path().join("regular.txt"),
+            temp.path().join("link.txt"),
+        )
+        .unwrap();
 
         let result = scan(temp.path()).unwrap();
 
@@ -514,7 +536,11 @@ mod tests {
         fs::write(temp.path().join("regular.txt"), "content").unwrap();
 
         // Create a symlink pointing to a non-existent target
-        symlink(temp.path().join("nonexistent.txt"), temp.path().join("broken_link.txt")).unwrap();
+        symlink(
+            temp.path().join("nonexistent.txt"),
+            temp.path().join("broken_link.txt"),
+        )
+        .unwrap();
 
         let result = scan(temp.path()).unwrap();
 

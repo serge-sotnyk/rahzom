@@ -371,7 +371,10 @@ pub fn render_disk_space_warning_dialog(frame: &mut Frame, dialog: &DiskSpaceWar
         Line::from(""),
         Line::from(vec![
             Span::styled("Required:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format_bytes(dialog.required), Style::default().fg(Color::Red)),
+            Span::styled(
+                format_bytes(dialog.required),
+                Style::default().fg(Color::Red),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Available: ", Style::default().fg(Color::DarkGray)),
@@ -563,7 +566,10 @@ pub fn render_settings_dialog(frame: &mut Frame, dialog: &SettingsDialog) {
         Line::from(vec![
             Span::styled(" Tab ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(" Next  "),
-            Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::styled(
+                " Enter ",
+                Style::default().fg(Color::Black).bg(Color::Green),
+            ),
             Span::raw(" Save  "),
             Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(" Cancel"),

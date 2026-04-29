@@ -257,7 +257,11 @@ impl Executor {
                 }
                 Err(ExecuteError::Failed(error, kind)) => {
                     progress.on_file_complete(&action, false);
-                    result.failed.push(FailedAction { action, error, kind });
+                    result.failed.push(FailedAction {
+                        action,
+                        error,
+                        kind,
+                    });
                 }
             }
         }
@@ -444,7 +448,8 @@ impl Executor {
         let mut reader = BufReader::with_capacity(64 * 1024, src_file);
         let mut writer = BufWriter::with_capacity(64 * 1024, dst_file);
 
-        io::copy(&mut reader, &mut writer).map_err(|e| ExecuteError::from_io(e, "Failed to copy"))?;
+        io::copy(&mut reader, &mut writer)
+            .map_err(|e| ExecuteError::from_io(e, "Failed to copy"))?;
 
         writer
             .flush()
@@ -494,7 +499,8 @@ impl Executor {
         let trash_name = format!("{}.{}", filename, timestamp);
         let trash_path = trash_dir.join(trash_name);
 
-        fs::rename(path, &trash_path).map_err(|e| ExecuteError::from_io(e, "Failed to move to trash"))
+        fs::rename(path, &trash_path)
+            .map_err(|e| ExecuteError::from_io(e, "Failed to move to trash"))
     }
 
     fn create_backup(&self, path: &Path, root: &Path) -> std::result::Result<(), ExecuteError> {
@@ -512,7 +518,8 @@ impl Executor {
         let backup_path = backup_dir.join(&backup_name);
 
         // Copy to backup
-        fs::copy(path, &backup_path).map_err(|e| ExecuteError::from_io(e, "Failed to create backup"))?;
+        fs::copy(path, &backup_path)
+            .map_err(|e| ExecuteError::from_io(e, "Failed to create backup"))?;
 
         // Rotate old backups
         self.rotate_backups(&backup_dir, &filename)?;
@@ -643,13 +650,14 @@ fn set_file_attributes(path: &Path, src_path: &Path) -> io::Result<()> {
     let new_attrs = (dst_attrs & !ATTRS_MASK) | attrs_to_apply;
 
     // Convert path to wide string for Windows API
-    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
     let result = unsafe {
-        windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
-            wide_path.as_ptr(),
-            new_attrs,
-        )
+        windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide_path.as_ptr(), new_attrs)
     };
 
     if result == 0 {

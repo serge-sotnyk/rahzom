@@ -264,9 +264,7 @@ dist/
             }
         }
 
-        builder
-            .build()
-            .with_context(|| "Failed to build glob set")
+        builder.build().with_context(|| "Failed to build glob set")
     }
 }
 
@@ -387,11 +385,8 @@ mod tests {
 
     #[test]
     fn test_os_files() {
-        let excl = Exclusions::from_patterns(&[
-            ".DS_Store".to_string(),
-            "Thumbs.db".to_string(),
-        ])
-        .unwrap();
+        let excl =
+            Exclusions::from_patterns(&[".DS_Store".to_string(), "Thumbs.db".to_string()]).unwrap();
 
         assert!(excl.is_excluded(Path::new(".DS_Store"), false));
         assert!(excl.is_excluded(Path::new("Thumbs.db"), false));

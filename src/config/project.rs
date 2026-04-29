@@ -333,10 +333,10 @@ mod tests {
         manager.save_project(&project).unwrap();
         let loaded = manager.load_project("with-settings").unwrap();
 
-        assert_eq!(loaded.settings.verify_hash, true);
+        assert!(loaded.settings.verify_hash);
         assert_eq!(loaded.settings.backup_versions, 10);
         assert_eq!(loaded.settings.deleted_retention_days, 30);
-        assert_eq!(loaded.settings.soft_delete, false);
+        assert!(!loaded.settings.soft_delete);
     }
 
     #[test]
@@ -409,9 +409,9 @@ mod tests {
     fn test_default_settings() {
         let settings = ProjectSettings::default();
 
-        assert_eq!(settings.verify_hash, false);
+        assert!(!settings.verify_hash);
         assert_eq!(settings.backup_versions, 5);
         assert_eq!(settings.deleted_retention_days, 90);
-        assert_eq!(settings.soft_delete, true);
+        assert!(settings.soft_delete);
     }
 }

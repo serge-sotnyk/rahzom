@@ -192,7 +192,10 @@ pub fn diff(
     // Process left side entries
     for (path, left_entry) in &left_files {
         // Skip if already handled as case conflict
-        if case_conflicts.iter().any(|p| p.to_lowercase() == path.to_lowercase()) {
+        if case_conflicts
+            .iter()
+            .any(|p| p.to_lowercase() == path.to_lowercase())
+        {
             continue;
         }
         let right_entry = right_files.get(path);
@@ -219,7 +222,10 @@ pub fn diff(
             continue; // Already processed
         }
         // Skip if already handled as case conflict
-        if case_conflicts.iter().any(|p| p.to_lowercase() == path.to_lowercase()) {
+        if case_conflicts
+            .iter()
+            .any(|p| p.to_lowercase() == path.to_lowercase())
+        {
             continue;
         }
 

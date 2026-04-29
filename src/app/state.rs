@@ -312,12 +312,10 @@ impl UserAction {
                 path: path.clone(),
                 size: *size,
             }),
-            UserAction::DeleteLeft { path } => Some(SyncAction::DeleteLeft {
-                path: path.clone(),
-            }),
-            UserAction::DeleteRight { path } => Some(SyncAction::DeleteRight {
-                path: path.clone(),
-            }),
+            UserAction::DeleteLeft { path } => Some(SyncAction::DeleteLeft { path: path.clone() }),
+            UserAction::DeleteRight { path } => {
+                Some(SyncAction::DeleteRight { path: path.clone() })
+            }
             UserAction::Skip { .. } => None,
         }
     }
