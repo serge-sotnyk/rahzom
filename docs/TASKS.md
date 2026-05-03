@@ -25,9 +25,11 @@
 | 10c | Fix Direction Change | 0.1 day | Delete action for one-sided files |
 | 11 | Error Handling & Edge Cases | 1 day | Locked files, long paths, etc. |
 | 12 | Project Settings | 0.5 day | Configurable backup/retention settings |
-| 13 | Polish & Integration Tests | 1 day | End-to-end tests, README |
+| 13 | Polish & Integration Tests | done | README baseline, sandbox testing infra, health audit |
+| 14 | Manual Application Testing & Bug Fixing | TBD | Run application via sandboxes, fix discovered issues |
+| 15 | Final Release Polish & CI | 1 day | Integration tests, CI, performance, README polish, release |
 
-**Total estimate: 8-13 days of focused work**
+**Total estimate: 8-13 days of focused work for the MVP core (Stages 0-13). Stages 14-15 add testing and release-prep time on top.**
 
 ---
 
@@ -976,48 +978,134 @@ Arrows now mean "which side is source of truth":
 
 ## Stage 13: Polish & Integration Tests
 
-**Goal**: End-to-end testing, documentation, release preparation.
+**Goal**: Capture what was actually delivered after Stage 12. Items originally
+planned here that were not done (integration tests, CI, performance benchmarks,
+README screenshots, release build verification, GitHub release) have been
+moved to Stage 15.
 
 ### Tasks
 
-#### 13.1 Integration tests
+#### 13.1 README baseline
+- Build/test commands
+- Architecture overview
+- Project structure
+- File exclusions documentation
+- Dependencies list
+- Documentation references
+- Testing notes
+
+(Screenshots and "Known Limitations" section are deferred to Stage 15.)
+
+#### 13.2 Sandbox testing infrastructure
+- Linux Docker + tmux harness — see `docs/rahzom-tui-testing-spec.md`,
+  `docs/features/0001_PLAN_tui_testing_skills.md`
+- Windows ConPTY + `pty-wrapper` — see `docs/rahzom-windows-testing-spec.md`,
+  `docs/features/0002_PLAN_windows_sandbox_mcp_testing.md`
+- Skills: `sandbox-linux-init`, `sandbox-linux-testing`,
+  `sandbox-windows-init`, `sandbox-windows-testing` in `.claude/skills/` and
+  `.agents/skills/`
+
+#### 13.3 Health audit
+- `cargo fmt` clean
+- `cargo clippy` warnings fixed
+- Dependencies updated — see commit `c53c11a`,
+  plan in `docs/features/0003_PLAN_dependencies_health_audit.md`
+
+### Definition of Done
+- [x] README baseline content present
+- [x] Sandbox testing infrastructure built (Linux + Windows)
+- [x] Health audit pass: `cargo fmt`, `cargo clippy`, deps updated
+
+---
+
+## Stage 14: Manual Application Testing & Bug Fixing
+
+**Goal**: Manual testing of the application via sandbox testing infrastructure
+(Linux Docker + tmux, Windows ConPTY + pty-wrapper) and fixing issues
+discovered during testing.
+
+**Version**: 0.13.0 → 0.14.0 (feature)
+
+### Known Issues to Address
+
+These issues were observed before this stage was scheduled and must be
+reproduced in sandbox before fixing:
+
+- **Preview list — long path display**: paths are rendered raw via
+  `path.display()` and get truncated by the terminal on the right side,
+  hiding the actual filename. Smart truncation (e.g. middle ellipsis or
+  filename-priority truncation) is missing in
+  `src/ui/screens.rs::render_action_item`.
+
+- **Preview list — sort order**: actions inside the "files" group are not
+  sorted by path. `src/sync/differ.rs::diff` only groups directory-creates
+  first; remaining actions stay in HashMap-iteration order.
+
+### Tasks
+
+(To be populated as bugs are discovered and triaged during sandbox runs.)
+
+### Definition of Done
+- [ ] All issues found during manual testing are either fixed or moved to a
+  follow-up backlog with explicit rationale
+- [ ] Known issues above are reproduced in sandbox and resolved or deferred
+
+---
+
+## Stage 15: Final Release Polish & CI
+
+**Goal**: End-to-end testing, automation, and release preparation. These items
+were originally part of Stage 13 but were not actually delivered, so they are
+tracked here with empty checkboxes.
+
+**Version**: 0.14.x → 0.15.0 (feature)
+
+### Tasks
+
+#### 15.1 Integration tests
 - Full cycle: create project → analyze → sync → verify
 - Test with generated complex folder structure
 - Test conflict resolution flows
 - Test error recovery
 
-#### 13.2 Cross-platform testing
-- Test on Windows (especially long paths)
-- Test on Linux
-- Test on macOS (if available)
+Note: `tests/integration/mod.rs` is currently an empty stub
+(`// Integration tests will be added in later stages`); also fix
+`tests/common::set_file_mtime` (currently a TODO with no real `mtime` applied) —
+needed for any time-based test.
 
-#### 13.3 Performance testing
-- Scan 50k files, measure time
+#### 15.2 Cross-platform CI
+- `.github/workflows/ci.yml` with matrix `[ubuntu-latest, windows-latest, macos-latest]`
+- Steps: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test`, `cargo build --release`
+
+#### 15.3 Performance testing
+- Scan 50k files, measure time (budget from `docs/REQUIREMENTS.md` §13.2:
+  under 60 sec on SSD)
 - Sync 1000 files, measure time
 - Profile and optimize if needed
 
-#### 13.4 README
-- Installation instructions
-- Quick start guide
-- Screenshots
-- Known limitations
+#### 15.4 README polish
+- Screenshots (optional, via sandbox)
+- Known Limitations section — list from `docs/REQUIREMENTS.md` §6 / §16
+  (symlinks skipped, no rename detection, no parallel ops, FAT32 tolerance,
+  Windows invalid filenames skipped on Linux side, deleted-files retention)
 
-#### 13.5 Release build
-- `cargo build --release`
-- Test release binary
+#### 15.5 Release build verification
+- `cargo build --release` on Windows, Linux, macOS
+- Test release binary smoke launch
 - Strip symbols for smaller size (optional)
 
-#### 13.6 GitHub release (optional)
+#### 15.6 GitHub release
 - Tag version
 - Build binaries for all platforms via CI
 - Create release with binaries
 
 ### Definition of Done
-- [x] Integration tests pass
-- [x] Tested on target platforms
-- [x] README complete
-- [x] Release binary works
-- [x] Performance acceptable
+- [ ] Integration tests pass
+- [ ] Tested on target platforms
+- [ ] README complete (screenshots + Known Limitations)
+- [ ] Release binary works on all three platforms
+- [ ] Performance acceptable
 
 ---
 
