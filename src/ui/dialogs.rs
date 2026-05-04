@@ -10,9 +10,13 @@ use ratatui::Frame;
 
 use crate::app::{
     DialogField, DiskSpaceWarningDialog, ExclusionsInfoDialog, FileErrorDialog, NewProjectDialog,
-    SettingsDialog, SettingsField, SyncConfirmDialog,
+    PreviewState, SettingsDialog, SettingsField, SyncConfirmDialog, UserAction,
 };
+use crate::config::project::Project;
+use crate::sync::differ::SyncAction;
 use crate::sync::executor::SyncErrorKind;
+use crate::sync::scanner::{FileEntry, ScanResult};
+use crate::ui::screens::conflict_reason_label;
 use crate::ui::{centered_rect, format_bytes};
 
 /// Renders new project dialog
@@ -576,4 +580,212 @@ pub fn render_settings_dialog(frame: &mut Frame, dialog: &SettingsDialog) {
         ])
     };
     frame.render_widget(Paragraph::new(hint), chunks[9]);
+}
+
+/// Renders the per-action details popup shown on Enter from the preview list.
+pub fn render_action_details_dialog(
+    frame: &mut Frame,
+    preview: &PreviewState,
+    project: Option<&Project>,
+    action_index: usize,
+) {
+    let Some(action) = preview.actions.get(action_index) else {
+        return;
+    };
+
+    let frame_area = frame.area();
+    // ~70% width, generous min height so wrapped paths and metadata fit.
+    let area = centered_rect(70, 14, frame_area);
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Action details ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1), // spacing
+        Constraint::Min(1),    // body
+        Constraint::Length(1), // footer
+    ])
+    .split(inner.inner(Margin::new(1, 0)));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // 1. Full path (wrapped via Paragraph::wrap below).
+    lines.push(Line::from(vec![
+        Span::styled("Path: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            action.path().display().to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    // 2. Action and direction.
+    let (icon, color, description) = describe_action(action, project);
+    let mut action_spans = vec![
+        Span::styled("Action: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{} ", icon), Style::default().fg(color)),
+        Span::raw(description),
+    ];
+    if action.is_modified() {
+        action_spans.push(Span::raw("  "));
+        action_spans.push(Span::styled(
+            "(modified by user)",
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    lines.push(Line::from(action_spans));
+
+    // 3. Optional reason for conflicts/skips.
+    if let Some(reason) = describe_reason(action) {
+        lines.push(Line::from(vec![
+            Span::styled("Reason: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(reason, Style::default().fg(Color::Yellow)),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    // 4. Left/right metadata.
+    let left_entry = lookup_entry(preview.left_scan.as_ref(), action.path());
+    let right_entry = lookup_entry(preview.right_scan.as_ref(), action.path());
+    lines.push(metadata_line("Left:  ", left_entry));
+    lines.push(metadata_line("Right: ", right_entry));
+
+    let body = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+    frame.render_widget(body, chunks[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" / "),
+        Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" Close"),
+    ]))
+    .alignment(Alignment::Center);
+    frame.render_widget(footer, chunks[2]);
+}
+
+fn describe_action(
+    action: &UserAction,
+    project: Option<&Project>,
+) -> (&'static str, Color, String) {
+    let (left_path, right_path) = match project {
+        Some(p) => (
+            p.left_path.display().to_string(),
+            p.right_path.display().to_string(),
+        ),
+        None => ("LEFT".to_string(), "RIGHT".to_string()),
+    };
+
+    match action {
+        UserAction::Original(SyncAction::CopyToRight { size, .. }) => (
+            "→",
+            Color::Green,
+            format!(
+                "Copy from {} to {} ({})",
+                left_path,
+                right_path,
+                format_bytes(*size)
+            ),
+        ),
+        UserAction::Original(SyncAction::CopyToLeft { size, .. }) => (
+            "←",
+            Color::Blue,
+            format!(
+                "Copy from {} to {} ({})",
+                right_path,
+                left_path,
+                format_bytes(*size)
+            ),
+        ),
+        UserAction::Original(SyncAction::DeleteRight { .. }) => {
+            ("✕→", Color::Red, format!("Delete from {}", right_path))
+        }
+        UserAction::Original(SyncAction::DeleteLeft { .. }) => {
+            ("←✕", Color::Red, format!("Delete from {}", left_path))
+        }
+        UserAction::Original(SyncAction::CreateDirRight { .. }) => (
+            "📁→",
+            Color::Green,
+            format!("Create directory in {}", right_path),
+        ),
+        UserAction::Original(SyncAction::CreateDirLeft { .. }) => (
+            "←📁",
+            Color::Blue,
+            format!("Create directory in {}", left_path),
+        ),
+        UserAction::Original(SyncAction::Conflict { .. }) => (
+            "⚠",
+            Color::Yellow,
+            "Conflict — needs resolution".to_string(),
+        ),
+        UserAction::Original(SyncAction::Skip { .. }) | UserAction::Skip { .. } => {
+            ("·", Color::DarkGray, "Skip — no action".to_string())
+        }
+        UserAction::CopyToRight { size, .. } => (
+            "→",
+            Color::Green,
+            format!(
+                "Copy from {} to {} ({})",
+                left_path,
+                right_path,
+                format_bytes(*size)
+            ),
+        ),
+        UserAction::CopyToLeft { size, .. } => (
+            "←",
+            Color::Blue,
+            format!(
+                "Copy from {} to {} ({})",
+                right_path,
+                left_path,
+                format_bytes(*size)
+            ),
+        ),
+        UserAction::DeleteRight { .. } => ("✕→", Color::Red, format!("Delete from {}", right_path)),
+        UserAction::DeleteLeft { .. } => ("←✕", Color::Red, format!("Delete from {}", left_path)),
+    }
+}
+
+fn describe_reason(action: &UserAction) -> Option<String> {
+    match action {
+        UserAction::Original(SyncAction::Conflict { reason, .. }) => {
+            Some(conflict_reason_label(reason).to_string())
+        }
+        UserAction::Original(SyncAction::Skip { reason, .. }) => Some(reason.clone()),
+        _ => None,
+    }
+}
+
+fn lookup_entry<'a>(scan: Option<&'a ScanResult>, target: &Path) -> Option<&'a FileEntry> {
+    scan?.entries.iter().find(|e| e.path == target)
+}
+
+fn metadata_line(label: &'static str, entry: Option<&FileEntry>) -> Line<'static> {
+    let mut spans = vec![Span::styled(label, Style::default().fg(Color::DarkGray))];
+    match entry {
+        Some(e) if e.is_dir => {
+            spans.push(Span::styled(
+                format!("(dir)        {}", e.mtime.format("%Y-%m-%d %H:%M")),
+                Style::default(),
+            ));
+        }
+        Some(e) => {
+            spans.push(Span::styled(
+                format!(
+                    "{:>10}  {}",
+                    format_bytes(e.size),
+                    e.mtime.format("%Y-%m-%d %H:%M")
+                ),
+                Style::default(),
+            ));
+        }
+        None => {
+            spans.push(Span::styled("—", Style::default().fg(Color::DarkGray)));
+        }
+    }
+    Line::from(spans)
 }

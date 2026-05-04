@@ -45,6 +45,7 @@ impl App {
             Dialog::DiskSpaceWarning(_) => self.handle_key_disk_space_warning(code),
             Dialog::FileError(_) => self.handle_key_file_error(code),
             Dialog::ProjectSettings(_) => self.handle_key_settings(code),
+            Dialog::ActionDetails { .. } => self.handle_key_action_details(code),
         }
     }
 
@@ -137,6 +138,12 @@ impl App {
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 self.cycle_filter();
             }
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                self.cycle_sort();
+            }
+            KeyCode::Enter => {
+                self.show_action_details();
+            }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.change_action_to_left();
             }
@@ -160,7 +167,7 @@ impl App {
             }
             KeyCode::Home => {
                 if let Some(ref mut preview) = self.preview {
-                    let indices = preview.filtered_indices();
+                    let indices = preview.sorted_filtered_indices();
                     if !indices.is_empty() {
                         preview.selected = 0;
                         preview.scroll_offset = 0;
@@ -169,13 +176,19 @@ impl App {
             }
             KeyCode::End => {
                 if let Some(ref mut preview) = self.preview {
-                    let indices = preview.filtered_indices();
+                    let indices = preview.sorted_filtered_indices();
                     if !indices.is_empty() {
                         preview.selected = indices.len() - 1;
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn handle_key_action_details(&mut self, code: KeyCode) {
+        if matches!(code, KeyCode::Esc | KeyCode::Enter) {
+            self.dialog = Dialog::None;
         }
     }
 
@@ -507,7 +520,7 @@ impl App {
                         if let Some(ref mut preview) = self.preview {
                             let relative_y = mouse.row.saturating_sub(content_area.y + 1);
                             let index = relative_y as usize + preview.scroll_offset;
-                            let indices = preview.filtered_indices();
+                            let indices = preview.sorted_filtered_indices();
 
                             if index < indices.len() {
                                 preview.selected = index;
@@ -564,7 +577,7 @@ impl App {
 
     fn select_next_action(&mut self) {
         if let Some(ref mut preview) = self.preview {
-            let indices = preview.filtered_indices();
+            let indices = preview.sorted_filtered_indices();
             if !indices.is_empty() && preview.selected < indices.len() - 1 {
                 preview.selected += 1;
             }
@@ -581,15 +594,36 @@ impl App {
 
     fn cycle_filter(&mut self) {
         if let Some(ref mut preview) = self.preview {
+            let pinned = preview.capture_selected_path();
             preview.filter = preview.filter.next();
-            preview.selected = 0;
             preview.scroll_offset = 0;
+            preview.restore_selection_to_path(pinned);
+        }
+    }
+
+    fn cycle_sort(&mut self) {
+        if let Some(ref mut preview) = self.preview {
+            let pinned = preview.capture_selected_path();
+            preview.sort = preview.sort.next();
+            preview.scroll_offset = 0;
+            preview.restore_selection_to_path(pinned);
+        }
+    }
+
+    fn show_action_details(&mut self) {
+        if let Some(ref preview) = self.preview {
+            let indices = preview.sorted_filtered_indices();
+            if let Some(&real_idx) = indices.get(preview.selected) {
+                self.dialog = Dialog::ActionDetails {
+                    action_index: real_idx,
+                };
+            }
         }
     }
 
     fn toggle_selection(&mut self) {
         if let Some(ref mut preview) = self.preview {
-            let indices = preview.filtered_indices();
+            let indices = preview.sorted_filtered_indices();
             if let Some(&real_idx) = indices.get(preview.selected) {
                 if preview.selected_items.contains(&real_idx) {
                     preview.selected_items.remove(&real_idx);
@@ -602,7 +636,8 @@ impl App {
 
     fn change_action_to_left(&mut self) {
         if let Some(ref mut preview) = self.preview {
-            let indices = preview.filtered_indices();
+            let pinned = preview.capture_selected_path();
+            let indices = preview.sorted_filtered_indices();
             if let Some(&real_idx) = indices.get(preview.selected) {
                 if let Some(action) = preview.actions.get(real_idx) {
                     let path = action.path().clone();
@@ -616,12 +651,14 @@ impl App {
                     }
                 }
             }
+            preview.restore_selection_to_path(pinned);
         }
     }
 
     fn change_action_to_right(&mut self) {
         if let Some(ref mut preview) = self.preview {
-            let indices = preview.filtered_indices();
+            let pinned = preview.capture_selected_path();
+            let indices = preview.sorted_filtered_indices();
             if let Some(&real_idx) = indices.get(preview.selected) {
                 if let Some(action) = preview.actions.get(real_idx) {
                     let path = action.path().clone();
@@ -635,24 +672,27 @@ impl App {
                     }
                 }
             }
+            preview.restore_selection_to_path(pinned);
         }
     }
 
     fn skip_selected_action(&mut self) {
         if let Some(ref mut preview) = self.preview {
-            let indices = preview.filtered_indices();
+            let pinned = preview.capture_selected_path();
+            let indices = preview.sorted_filtered_indices();
             if let Some(&real_idx) = indices.get(preview.selected) {
                 if let Some(action) = preview.actions.get(real_idx) {
                     let path = action.path().clone();
                     preview.actions[real_idx] = UserAction::Skip { path };
                 }
             }
+            preview.restore_selection_to_path(pinned);
         }
     }
 
     fn reset_selected_action(&mut self) {
         if let Some(ref mut preview) = self.preview {
-            let indices = preview.filtered_indices();
+            let indices = preview.sorted_filtered_indices();
             if let Some(&_real_idx) = indices.get(preview.selected) {
                 // We need to restore the original action - but we don't have it stored separately
                 // For now, action reset is not fully implemented

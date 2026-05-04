@@ -28,7 +28,10 @@ pub enum Dialog {
     None,
     NewProject(NewProjectDialog),
     DeleteConfirm(String),
-    CreateDirConfirm { path: PathBuf, is_left: bool },
+    CreateDirConfirm {
+        path: PathBuf,
+        is_left: bool,
+    },
     Error(String),
     SyncConfirm(SyncConfirmDialog),
     CancelSyncConfirm,
@@ -36,6 +39,10 @@ pub enum Dialog {
     DiskSpaceWarning(DiskSpaceWarningDialog),
     FileError(FileErrorDialog),
     ProjectSettings(SettingsDialog),
+    /// Details popup for a single preview action
+    ActionDetails {
+        action_index: usize,
+    },
 }
 
 /// Disk space warning dialog
@@ -67,8 +74,8 @@ pub struct FileErrorDialog {
 /// Filter mode for preview
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PreviewFilter {
-    #[default]
     All,
+    #[default]
     Changes,
     Conflicts,
 }
@@ -87,6 +94,33 @@ impl PreviewFilter {
             Self::All => "All",
             Self::Changes => "Changes",
             Self::Conflicts => "Conflicts",
+        }
+    }
+}
+
+/// Sort key for preview list
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreviewSort {
+    #[default]
+    Path,
+    Type,
+    Size,
+}
+
+impl PreviewSort {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Path => Self::Type,
+            Self::Type => Self::Size,
+            Self::Size => Self::Path,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Path => "Path",
+            Self::Type => "Type",
+            Self::Size => "Size",
         }
     }
 }
@@ -340,6 +374,7 @@ pub struct PreviewSummary {
 pub struct PreviewState {
     pub actions: Vec<UserAction>,
     pub filter: PreviewFilter,
+    pub sort: PreviewSort,
     pub selected: usize,
     pub scroll_offset: usize,
     pub selected_items: HashSet<usize>,
@@ -355,7 +390,8 @@ impl PreviewState {
                 .into_iter()
                 .map(UserAction::Original)
                 .collect(),
-            filter: PreviewFilter::All,
+            filter: PreviewFilter::default(),
+            sort: PreviewSort::default(),
             selected: 0,
             scroll_offset: 0,
             selected_items: HashSet::new(),
@@ -364,6 +400,7 @@ impl PreviewState {
         }
     }
 
+    /// Indices into `actions` that pass the current filter, in original order.
     pub fn filtered_indices(&self) -> Vec<usize> {
         self.actions
             .iter()
@@ -375,6 +412,49 @@ impl PreviewState {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Indices into `actions` that pass the current filter, sorted by the
+    /// current sort key. This is the rendered list.
+    pub fn sorted_filtered_indices(&self) -> Vec<usize> {
+        let mut indices = self.filtered_indices();
+        indices.sort_by(|&a, &b| {
+            let aa = &self.actions[a];
+            let bb = &self.actions[b];
+            sort_key_cmp(aa, bb, self.sort)
+        });
+        indices
+    }
+
+    /// Path of the currently selected entry in the rendered list, if any.
+    pub fn capture_selected_path(&self) -> Option<PathBuf> {
+        let indices = self.sorted_filtered_indices();
+        let real = *indices.get(self.selected)?;
+        Some(self.actions[real].path().clone())
+    }
+
+    /// Move `selected` to the entry whose path matches `path` in the new
+    /// rendered list, or to the largest index that is strictly smaller, or
+    /// to 0 if that doesn't exist.
+    pub fn restore_selection_to_path(&mut self, path: Option<PathBuf>) {
+        let indices = self.sorted_filtered_indices();
+        if indices.is_empty() {
+            self.selected = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+        if let Some(target) = path {
+            if let Some(pos) = indices
+                .iter()
+                .position(|&i| self.actions[i].path() == &target)
+            {
+                self.selected = pos;
+                return;
+            }
+        }
+        if self.selected >= indices.len() {
+            self.selected = indices.len() - 1;
+        }
     }
 
     pub fn summary(&self) -> PreviewSummary {
@@ -495,4 +575,236 @@ pub fn is_skip_action(action: &UserAction) -> bool {
 
 pub fn is_conflict_action(action: &UserAction) -> bool {
     matches!(action, UserAction::Original(SyncAction::Conflict { .. }))
+}
+
+/// Type rank for sorting. Lower = earlier.
+fn type_rank(action: &UserAction) -> u8 {
+    match action {
+        UserAction::Original(SyncAction::Conflict { .. }) => 0,
+        UserAction::Original(SyncAction::CopyToRight { .. })
+        | UserAction::CopyToRight { .. }
+        | UserAction::Original(SyncAction::CreateDirRight { .. }) => 1,
+        UserAction::Original(SyncAction::CopyToLeft { .. })
+        | UserAction::CopyToLeft { .. }
+        | UserAction::Original(SyncAction::CreateDirLeft { .. }) => 2,
+        UserAction::Original(SyncAction::DeleteRight { .. })
+        | UserAction::DeleteRight { .. }
+        | UserAction::Original(SyncAction::DeleteLeft { .. })
+        | UserAction::DeleteLeft { .. } => 3,
+        UserAction::Original(SyncAction::Skip { .. }) | UserAction::Skip { .. } => 4,
+    }
+}
+
+/// Size for sorting. Returns 0 for non-file actions.
+fn action_size(action: &UserAction) -> u64 {
+    match action {
+        UserAction::Original(SyncAction::CopyToRight { size, .. })
+        | UserAction::Original(SyncAction::CopyToLeft { size, .. })
+        | UserAction::CopyToRight { size, .. }
+        | UserAction::CopyToLeft { size, .. } => *size,
+        _ => 0,
+    }
+}
+
+fn path_key(action: &UserAction) -> String {
+    action.path().to_string_lossy().to_lowercase()
+}
+
+fn sort_key_cmp(a: &UserAction, b: &UserAction, sort: PreviewSort) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match sort {
+        PreviewSort::Path => path_key(a).cmp(&path_key(b)),
+        PreviewSort::Type => {
+            // Modified entries come first, each section sorted by type then path.
+            let am = !a.is_modified();
+            let bm = !b.is_modified();
+            am.cmp(&bm)
+                .then_with(|| type_rank(a).cmp(&type_rank(b)))
+                .then_with(|| path_key(a).cmp(&path_key(b)))
+        }
+        PreviewSort::Size => {
+            // Largest first; non-files (size 0) sink to the end. Tie-break by path.
+            match action_size(b).cmp(&action_size(a)) {
+                Ordering::Equal => path_key(a).cmp(&path_key(b)),
+                ord => ord,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::differ::{ConflictReason, SyncAction};
+
+    fn mk_state(actions: Vec<UserAction>) -> PreviewState {
+        PreviewState {
+            actions,
+            ..Default::default()
+        }
+    }
+
+    fn copy_right(p: &str, size: u64) -> UserAction {
+        UserAction::Original(SyncAction::CopyToRight {
+            path: PathBuf::from(p),
+            size,
+        })
+    }
+
+    fn copy_left(p: &str, size: u64) -> UserAction {
+        UserAction::Original(SyncAction::CopyToLeft {
+            path: PathBuf::from(p),
+            size,
+        })
+    }
+
+    fn delete_right(p: &str) -> UserAction {
+        UserAction::Original(SyncAction::DeleteRight {
+            path: PathBuf::from(p),
+        })
+    }
+
+    fn skip(p: &str) -> UserAction {
+        UserAction::Original(SyncAction::Skip {
+            path: PathBuf::from(p),
+            reason: "excluded".to_string(),
+        })
+    }
+
+    fn conflict(p: &str) -> UserAction {
+        UserAction::Original(SyncAction::Conflict {
+            path: PathBuf::from(p),
+            reason: ConflictReason::BothModified,
+            left: None,
+            right: None,
+        })
+    }
+
+    fn paths_in_order(state: &PreviewState) -> Vec<String> {
+        state
+            .sorted_filtered_indices()
+            .into_iter()
+            .map(|i| state.actions[i].path().display().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn sort_by_path_is_case_insensitive() {
+        let mut state = mk_state(vec![
+            copy_right("Banana.txt", 1),
+            copy_right("apple.txt", 1),
+            copy_right("Cherry.txt", 1),
+        ]);
+        state.filter = PreviewFilter::All;
+        state.sort = PreviewSort::Path;
+        assert_eq!(
+            paths_in_order(&state),
+            vec!["apple.txt", "Banana.txt", "Cherry.txt"]
+        );
+    }
+
+    #[test]
+    fn sort_by_type_modified_first_then_groups() {
+        let mut state = mk_state(vec![
+            skip("z_skip.txt"),
+            copy_right("a_copy_right.txt", 5),
+            copy_left("b_copy_left.txt", 5),
+            delete_right("c_delete.txt"),
+            conflict("d_conflict.txt"),
+            // User-modified copy of an originally-skipped file.
+            UserAction::CopyToRight {
+                path: PathBuf::from("user_modified.txt"),
+                size: 1,
+            },
+        ]);
+        state.filter = PreviewFilter::All;
+        state.sort = PreviewSort::Type;
+        let order = paths_in_order(&state);
+
+        // Modified entries come first.
+        assert_eq!(order[0], "user_modified.txt");
+        // Then non-modified, by type rank: Conflict < Copy→ < Copy← < Delete < Skip.
+        assert_eq!(
+            order[1..],
+            [
+                "d_conflict.txt",
+                "a_copy_right.txt",
+                "b_copy_left.txt",
+                "c_delete.txt",
+                "z_skip.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_by_size_descending_files_first() {
+        let mut state = mk_state(vec![
+            copy_right("small.txt", 100),
+            copy_right("huge.txt", 100_000),
+            skip("zero.txt"),
+            copy_right("medium.txt", 5_000),
+        ]);
+        state.filter = PreviewFilter::All;
+        state.sort = PreviewSort::Size;
+        assert_eq!(
+            paths_in_order(&state),
+            vec!["huge.txt", "medium.txt", "small.txt", "zero.txt"]
+        );
+    }
+
+    #[test]
+    fn changes_filter_excludes_skips() {
+        let mut state = mk_state(vec![
+            copy_right("a.txt", 1),
+            skip("b.txt"),
+            conflict("c.txt"),
+        ]);
+        state.filter = PreviewFilter::Changes;
+        state.sort = PreviewSort::Path;
+        assert_eq!(paths_in_order(&state), vec!["a.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn restore_selection_keeps_path_through_filter_change() {
+        let mut state = mk_state(vec![
+            copy_right("a.txt", 1),
+            skip("b.txt"),
+            copy_right("c.txt", 1),
+        ]);
+        state.filter = PreviewFilter::All;
+        state.sort = PreviewSort::Path;
+        // Select "b.txt".
+        state.selected = 1;
+        let pinned = state.capture_selected_path();
+        assert_eq!(pinned.as_deref(), Some(Path::new("b.txt")));
+
+        // Switch to Changes — "b.txt" is hidden, selection should fall back.
+        state.filter = PreviewFilter::Changes;
+        state.restore_selection_to_path(pinned);
+        assert!(state.selected < state.sorted_filtered_indices().len());
+    }
+
+    #[test]
+    fn restore_selection_finds_same_path_after_sort_change() {
+        let mut state = mk_state(vec![
+            copy_right("z.txt", 100),
+            copy_right("a.txt", 1),
+            copy_right("m.txt", 5_000),
+        ]);
+        state.filter = PreviewFilter::All;
+        state.sort = PreviewSort::Path;
+        // selected = 2 → "z.txt" by path order.
+        state.selected = 2;
+        let pinned = state.capture_selected_path();
+        assert_eq!(pinned.as_deref(), Some(Path::new("z.txt")));
+
+        // Switch to Size: order becomes m, z, a. "z.txt" should be at index 1.
+        state.sort = PreviewSort::Size;
+        state.restore_selection_to_path(pinned);
+        let indices = state.sorted_filtered_indices();
+        assert_eq!(
+            state.actions[indices[state.selected]].path(),
+            Path::new("z.txt")
+        );
+    }
 }

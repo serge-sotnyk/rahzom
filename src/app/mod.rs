@@ -5,9 +5,9 @@ pub mod state;
 
 pub use state::{
     is_conflict_action, is_skip_action, Dialog, DialogField, DiskSpaceWarningDialog,
-    ExclusionsInfoDialog, FileErrorDialog, NewProjectDialog, PreviewFilter, PreviewState,
-    PreviewSummary, Screen, SettingsDialog, SettingsField, SyncCompleteState, SyncConfirmDialog,
-    SyncingState, UserAction,
+    ExclusionsInfoDialog, FileErrorDialog, NewProjectDialog, PreviewFilter, PreviewSort,
+    PreviewState, PreviewSummary, Screen, SettingsDialog, SettingsField, SyncCompleteState,
+    SyncConfirmDialog, SyncingState, UserAction,
 };
 
 use anyhow::Result;
@@ -32,11 +32,12 @@ use crate::sync::executor::{
 use crate::sync::metadata::{DeletedFile, FileAttributes, FileState, SyncMetadata};
 use crate::sync::scanner::scan_with_exclusions;
 use crate::ui::{
-    render_cancel_sync_confirm_dialog, render_create_dir_confirm_dialog,
-    render_delete_confirm_dialog, render_disk_space_warning_dialog, render_error_dialog,
-    render_exclusions_info_dialog, render_file_error_dialog, render_new_project_dialog,
-    render_preview, render_project_list, render_project_view, render_settings_dialog,
-    render_sync_complete, render_sync_confirm_dialog, render_syncing,
+    render_action_details_dialog, render_cancel_sync_confirm_dialog,
+    render_create_dir_confirm_dialog, render_delete_confirm_dialog,
+    render_disk_space_warning_dialog, render_error_dialog, render_exclusions_info_dialog,
+    render_file_error_dialog, render_new_project_dialog, render_preview, render_project_list,
+    render_project_view, render_settings_dialog, render_sync_complete, render_sync_confirm_dialog,
+    render_syncing,
 };
 use chrono::Utc;
 
@@ -792,6 +793,16 @@ impl App {
             Dialog::ProjectSettings(dialog) => {
                 render_settings_dialog(frame, dialog);
             }
+            Dialog::ActionDetails { action_index } => {
+                if let Some(ref preview) = self.preview {
+                    render_action_details_dialog(
+                        frame,
+                        preview,
+                        self.current_project.as_ref(),
+                        *action_index,
+                    );
+                }
+            }
         }
     }
 
@@ -851,7 +862,7 @@ impl App {
             }
             Screen::Preview => {
                 if let Some(ref preview) = self.preview {
-                    render_preview(frame, area, preview);
+                    render_preview(frame, area, preview, self.current_project.as_ref());
                 }
             }
             Screen::Syncing => {
@@ -919,6 +930,10 @@ impl App {
                     Span::raw(" Excl  "),
                     Span::styled(" F ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     Span::raw(" Filter  "),
+                    Span::styled(" O ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" Sort  "),
+                    Span::styled(" ↵ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" Detail  "),
                     Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     Span::raw(" Back "),
                 ]
@@ -1146,7 +1161,7 @@ mod tests {
         let preview = PreviewState::new(diff_result, left_scan, right_scan);
 
         assert!(!preview.actions.is_empty());
-        assert_eq!(preview.filter, PreviewFilter::All);
+        assert_eq!(preview.filter, PreviewFilter::Changes);
         assert_eq!(preview.selected, 0);
     }
 

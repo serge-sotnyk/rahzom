@@ -246,19 +246,6 @@ pub fn diff(
         result.add_action(action);
     }
 
-    // Sort actions: directories first, then files
-    result.actions.sort_by(|a, b| {
-        let a_is_dir = matches!(
-            a,
-            SyncAction::CreateDirLeft { .. } | SyncAction::CreateDirRight { .. }
-        );
-        let b_is_dir = matches!(
-            b,
-            SyncAction::CreateDirLeft { .. } | SyncAction::CreateDirRight { .. }
-        );
-        b_is_dir.cmp(&a_is_dir)
-    });
-
     result
 }
 
