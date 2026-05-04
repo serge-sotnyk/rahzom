@@ -32,7 +32,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 
 const CMD_FILE: &str = r"C:\rahzom-test\.bridge-commands";
 const SCREEN_FILE: &str = r"C:\rahzom-test\.bridge-screen";
+const LOG_FILE: &str = r"C:\rahzom-test\.bridge-log";
 const POLL_INTERVAL_MS: u64 = 100;
+
+/// Append a line to the log file. Both stdout and stderr on Windows share
+/// the console screen buffer that ratatui draws into, so any console write
+/// after the child spawns corrupts the TUI. Logging to a file keeps the
+/// bridge silent while preserving diagnostics.
+fn log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(LOG_FILE)
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -54,11 +70,15 @@ fn main() -> Result<()> {
     let exe = &args[1];
     let exe_args = &args[2..];
 
-    // Clear command file
+    // Clear command file and log file
     let _ = fs::write(CMD_FILE, "");
+    let _ = fs::write(LOG_FILE, "");
 
-    println!("[console-bridge] Starting: {} {:?}", exe, exe_args);
-    println!("[console-bridge] Listening for commands on: {}", CMD_FILE);
+    log(&format!("[console-bridge] Starting: {} {:?}", exe, exe_args));
+    log(&format!(
+        "[console-bridge] Listening for commands on: {}",
+        CMD_FILE
+    ));
 
     // Spawn child process (inherits console)
     let mut child = Command::new(exe)
@@ -76,12 +96,12 @@ fn main() -> Result<()> {
             // Check if child still running
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    println!("[console-bridge] Child exited with: {}", status);
+                    log(&format!("[console-bridge] Child exited with: {}", status));
                     break;
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    eprintln!("[console-bridge] Error checking child: {}", e);
+                    log(&format!("[console-bridge] Error checking child: {}", e));
                     break;
                 }
             }
@@ -99,13 +119,16 @@ fn main() -> Result<()> {
                         }
 
                         if line == "exit" {
-                            println!("[console-bridge] Exit command received");
+                            log("[console-bridge] Exit command received");
                             let _ = child.kill();
                             return Ok(());
                         }
 
                         if let Err(e) = process_command(stdin_handle, line) {
-                            eprintln!("[console-bridge] Error processing '{}': {}", line, e);
+                            log(&format!(
+                                "[console-bridge] Error processing '{}': {}",
+                                line, e
+                            ));
                         }
                     }
                 }
@@ -139,7 +162,7 @@ fn process_command(handle: HANDLE, cmd: &str) -> Result<()> {
         let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE)? };
         let screen = capture_screen(stdout_handle)?;
         fs::write(SCREEN_FILE, &screen)?;
-        println!("[console-bridge] Screen captured to {}", SCREEN_FILE);
+        log(&format!("[console-bridge] Screen captured to {}", SCREEN_FILE));
     } else {
         anyhow::bail!("Unknown command format: {}", cmd);
     }

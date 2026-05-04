@@ -115,6 +115,16 @@ Get-Content "C:\rahzom-test\.bridge-screen" -Raw
 
 Use Read tool to view `C:\rahzom-test\.bridge-screen` with ANSI colors rendered.
 
+## Bridge Log
+
+The bridge writes its own diagnostic messages (start/stop, capture confirmations, errors) to `C:\rahzom-test\.bridge-log` instead of stdout/stderr — both of those would corrupt the TUI screen buffer that rahzom draws into. The log is truncated at every bridge start.
+
+```powershell
+Get-Content "C:\rahzom-test\.bridge-log"
+```
+
+Read it whenever you need to confirm a `capture` actually fired, or to investigate an unknown-command error, without disturbing the running rahzom UI.
+
 ## Common Test Scenarios
 
 ### Create new project and analyze
