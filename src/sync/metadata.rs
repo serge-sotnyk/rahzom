@@ -88,6 +88,9 @@ pub struct FileState {
     pub attributes: FileAttributes,
     /// When this file was last synced
     pub last_synced: DateTime<Utc>,
+    /// True when the entry is a directory rather than a file
+    #[serde(default)]
+    pub is_dir: bool,
 }
 
 /// Record of a deleted file (for conflict detection)
@@ -104,6 +107,9 @@ pub struct DeletedFile {
     pub hash: Option<String>,
     /// When the file was deleted
     pub deleted_at: DateTime<Utc>,
+    /// True when the entry was a directory rather than a file
+    #[serde(default)]
+    pub is_dir: bool,
 }
 
 /// Complete sync metadata for one side of synchronization
@@ -245,6 +251,7 @@ mod tests {
             hash: Some("abc123".to_string()),
             attributes: FileAttributes::default(),
             last_synced: Utc::now(),
+            is_dir: false,
         }
     }
 
@@ -255,6 +262,7 @@ mod tests {
             mtime: Utc::now(),
             hash: None,
             deleted_at: Utc::now(),
+            is_dir: false,
         }
     }
 
@@ -409,5 +417,40 @@ mod tests {
         // Load with 15 day retention - should be kept
         let loaded = SyncMetadata::load_with_retention(temp.path(), 15).unwrap();
         assert_eq!(loaded.deleted.len(), 1);
+    }
+
+    #[test]
+    fn test_load_legacy_state_without_is_dir() {
+        // state.json files written by older versions have no is_dir field;
+        // they must deserialize cleanly with is_dir defaulting to false.
+        let temp = create_test_dir();
+        let rahzom_dir = temp.path().join(".rahzom");
+        fs::create_dir_all(&rahzom_dir).unwrap();
+
+        let legacy = r#"{
+            "files": [
+                {
+                    "path": "old.txt",
+                    "size": 10,
+                    "mtime": "2024-01-01T00:00:00Z",
+                    "last_synced": "2024-01-01T00:00:00Z"
+                }
+            ],
+            "deleted": [
+                {
+                    "path": "gone.txt",
+                    "size": 5,
+                    "mtime": "2024-01-01T00:00:00Z",
+                    "deleted_at": "2024-01-01T00:00:00Z"
+                }
+            ]
+        }"#;
+        fs::write(rahzom_dir.join("state.json"), legacy).unwrap();
+
+        let loaded = SyncMetadata::load_with_retention(temp.path(), 0).unwrap();
+        assert_eq!(loaded.files.len(), 1);
+        assert!(!loaded.files[0].is_dir);
+        assert_eq!(loaded.deleted.len(), 1);
+        assert!(!loaded.deleted[0].is_dir);
     }
 }

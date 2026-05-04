@@ -272,6 +272,25 @@ fn determine_action(
                 };
             }
 
+            // Type mismatch: one side is a file, the other is a directory.
+            // Refuse to silently pick a winner — surface as a conflict.
+            if l.is_dir != r.is_dir {
+                return SyncAction::Conflict {
+                    path: path_buf,
+                    reason: ConflictReason::BothModified,
+                    left: Some(FileInfo {
+                        size: l.size,
+                        mtime: l.mtime,
+                        hash: l.hash.clone(),
+                    }),
+                    right: Some(FileInfo {
+                        size: r.size,
+                        mtime: r.mtime,
+                        hash: r.hash.clone(),
+                    }),
+                };
+            }
+
             // Check if files are the same (within FAT32 tolerance)
             if files_equal(l, r) {
                 return SyncAction::Skip {
@@ -317,6 +336,12 @@ fn determine_action(
         // File only on left side
         (Some(l), None) => {
             if l.is_dir {
+                // Directory was synchronized before but is gone on the right —
+                // propagate the deletion. mtime/size of directories is not
+                // meaningful, so we treat presence in metadata as "unmodified".
+                if right_deleted || right_prev.is_some() {
+                    return SyncAction::DeleteLeft { path: path_buf };
+                }
                 return SyncAction::CreateDirRight { path: path_buf };
             }
 
@@ -363,6 +388,9 @@ fn determine_action(
         // File only on right side
         (None, Some(r)) => {
             if r.is_dir {
+                if left_deleted || left_prev.is_some() {
+                    return SyncAction::DeleteRight { path: path_buf };
+                }
                 return SyncAction::CreateDirLeft { path: path_buf };
             }
 
@@ -557,6 +585,19 @@ mod tests {
             hash: None,
             attributes: FileAttributes::default(),
             last_synced: Utc::now(),
+            is_dir: false,
+        }
+    }
+
+    fn make_dir_state(path: &str) -> FileState {
+        FileState {
+            path: path.to_string(),
+            size: 0,
+            mtime: Utc::now(),
+            hash: None,
+            attributes: FileAttributes::default(),
+            last_synced: Utc::now(),
+            is_dir: true,
         }
     }
 
@@ -858,5 +899,95 @@ mod tests {
         let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
 
         assert!(matches!(&result.actions[0], SyncAction::Skip { .. }));
+    }
+
+    #[test]
+    fn test_deleted_dir_propagates_to_right() {
+        // Both sides previously had `subdir/`. It is gone on the right —
+        // the differ must propose to delete it on the left as well.
+        let mut left_scan = empty_scan("/left");
+        left_scan.entries.push(make_dir_entry("subdir"));
+
+        let right_scan = empty_scan("/right");
+
+        let mut left_meta = SyncMetadata::new();
+        left_meta.files.push(make_dir_state("subdir"));
+
+        let mut right_meta = SyncMetadata::new();
+        right_meta.files.push(make_dir_state("subdir"));
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::DeleteLeft { path } if path == &PathBuf::from("subdir")
+        ));
+    }
+
+    #[test]
+    fn test_deleted_dir_propagates_to_left() {
+        // Symmetric to test_deleted_dir_propagates_to_right.
+        let left_scan = empty_scan("/left");
+
+        let mut right_scan = empty_scan("/right");
+        right_scan.entries.push(make_dir_entry("subdir"));
+
+        let mut left_meta = SyncMetadata::new();
+        left_meta.files.push(make_dir_state("subdir"));
+
+        let mut right_meta = SyncMetadata::new();
+        right_meta.files.push(make_dir_state("subdir"));
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::DeleteRight { path } if path == &PathBuf::from("subdir")
+        ));
+    }
+
+    #[test]
+    fn test_first_sync_dir_only_on_left_creates_right() {
+        // Regression: with empty metadata an unseen directory on the left
+        // must still be propagated as CreateDirRight, not deletion.
+        let mut left_scan = empty_scan("/left");
+        left_scan.entries.push(make_dir_entry("subdir"));
+
+        let right_scan = empty_scan("/right");
+        let left_meta = SyncMetadata::new();
+        let right_meta = SyncMetadata::new();
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::CreateDirRight { path } if path == &PathBuf::from("subdir")
+        ));
+    }
+
+    #[test]
+    fn test_type_change_creates_conflict() {
+        // Same path is a file on the left and a directory on the right.
+        // The differ must surface this as a conflict.
+        let now = Utc::now();
+        let mut left_scan = empty_scan("/left");
+        left_scan.entries.push(make_scan_entry("x", 100, now));
+
+        let mut right_scan = empty_scan("/right");
+        right_scan.entries.push(make_dir_entry("x"));
+
+        let left_meta = SyncMetadata::new();
+        let right_meta = SyncMetadata::new();
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert_eq!(result.conflicts, 1);
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::Conflict {
+                reason: ConflictReason::BothModified,
+                ..
+            }
+        ));
     }
 }

@@ -576,6 +576,7 @@ impl App {
                             hash: None,
                             attributes,
                             last_synced: now,
+                            is_dir: false,
                         };
                         left_meta.upsert_file(file_state.clone());
                         right_meta.upsert_file(file_state);
@@ -600,29 +601,55 @@ impl App {
                             hash: None,
                             attributes,
                             last_synced: now,
+                            is_dir: false,
                         };
                         left_meta.upsert_file(file_state.clone());
                         right_meta.upsert_file(file_state);
                     }
                 }
+                SyncAction::CreateDirRight { path } | SyncAction::CreateDirLeft { path } => {
+                    // Track synchronized directories on both sides so a later
+                    // deletion on one side can be detected and propagated.
+                    let file_state = FileState {
+                        path: path.to_string_lossy().to_string(),
+                        size: 0,
+                        mtime: now,
+                        hash: None,
+                        attributes: FileAttributes::default(),
+                        last_synced: now,
+                        is_dir: true,
+                    };
+                    left_meta.upsert_file(file_state.clone());
+                    right_meta.upsert_file(file_state);
+                }
                 SyncAction::DeleteRight { path } => {
                     let path_str = path.to_string_lossy().to_string();
+                    let was_dir = right_meta
+                        .find_file(&path_str)
+                        .map(|f| f.is_dir)
+                        .unwrap_or(false);
                     right_meta.mark_deleted(DeletedFile {
                         path: path_str,
                         size: 0,
                         mtime: now,
                         hash: None,
                         deleted_at: now,
+                        is_dir: was_dir,
                     });
                 }
                 SyncAction::DeleteLeft { path } => {
                     let path_str = path.to_string_lossy().to_string();
+                    let was_dir = left_meta
+                        .find_file(&path_str)
+                        .map(|f| f.is_dir)
+                        .unwrap_or(false);
                     left_meta.mark_deleted(DeletedFile {
                         path: path_str,
                         size: 0,
                         mtime: now,
                         hash: None,
                         deleted_at: now,
+                        is_dir: was_dir,
                     });
                 }
                 _ => {}
