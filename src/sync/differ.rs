@@ -13,6 +13,7 @@ pub struct FileInfo {
     pub size: u64,
     pub mtime: DateTime<Utc>,
     pub hash: Option<String>,
+    pub is_directory: bool,
 }
 
 /// Reason for a sync conflict
@@ -35,10 +36,18 @@ pub enum SyncAction {
     CopyToRight { path: PathBuf, size: u64 },
     /// Copy file from right to left
     CopyToLeft { path: PathBuf, size: u64 },
-    /// Delete file on right side
-    DeleteRight { path: PathBuf },
-    /// Delete file on left side
-    DeleteLeft { path: PathBuf },
+    /// Delete file or directory on right side
+    DeleteRight {
+        path: PathBuf,
+        size: u64,
+        is_directory: bool,
+    },
+    /// Delete file or directory on left side
+    DeleteLeft {
+        path: PathBuf,
+        size: u64,
+        is_directory: bool,
+    },
     /// Create directory on right side
     CreateDirRight { path: PathBuf },
     /// Create directory on left side
@@ -50,8 +59,13 @@ pub enum SyncAction {
         left: Option<FileInfo>,
         right: Option<FileInfo>,
     },
-    /// Skip this file (no action needed)
-    Skip { path: PathBuf, reason: String },
+    /// Skip this file or directory (no action needed)
+    Skip {
+        path: PathBuf,
+        reason: String,
+        size: u64,
+        is_directory: bool,
+    },
 }
 
 impl SyncAction {
@@ -60,8 +74,8 @@ impl SyncAction {
         match self {
             Self::CopyToRight { path, .. } => path,
             Self::CopyToLeft { path, .. } => path,
-            Self::DeleteRight { path } => path,
-            Self::DeleteLeft { path } => path,
+            Self::DeleteRight { path, .. } => path,
+            Self::DeleteLeft { path, .. } => path,
             Self::CreateDirRight { path } => path,
             Self::CreateDirLeft { path } => path,
             Self::Conflict { path, .. } => path,
@@ -112,6 +126,17 @@ struct FileEntry {
     mtime: DateTime<Utc>,
     is_dir: bool,
     hash: Option<String>,
+}
+
+impl FileEntry {
+    fn to_file_info(&self) -> FileInfo {
+        FileInfo {
+            size: self.size,
+            mtime: self.mtime,
+            hash: self.hash.clone(),
+            is_directory: self.is_dir,
+        }
+    }
 }
 
 /// Compares two scan results with their metadata and produces list of actions.
@@ -176,16 +201,8 @@ pub fn diff(
         result.add_action(SyncAction::Conflict {
             path: PathBuf::from(path),
             reason: ConflictReason::CaseConflict,
-            left: left_entry.map(|e| FileInfo {
-                size: e.size,
-                mtime: e.mtime,
-                hash: e.hash.clone(),
-            }),
-            right: right_entry.map(|e| FileInfo {
-                size: e.size,
-                mtime: e.mtime,
-                hash: e.hash.clone(),
-            }),
+            left: left_entry.map(|e| e.to_file_info()),
+            right: right_entry.map(|e| e.to_file_info()),
         });
     }
 
@@ -271,6 +288,8 @@ fn determine_action(
                 return SyncAction::Skip {
                     path: path_buf,
                     reason: "Directory exists on both sides".to_string(),
+                    size: 0,
+                    is_directory: true,
                 };
             }
 
@@ -280,16 +299,8 @@ fn determine_action(
                 return SyncAction::Conflict {
                     path: path_buf,
                     reason: ConflictReason::BothModified,
-                    left: Some(FileInfo {
-                        size: l.size,
-                        mtime: l.mtime,
-                        hash: l.hash.clone(),
-                    }),
-                    right: Some(FileInfo {
-                        size: r.size,
-                        mtime: r.mtime,
-                        hash: r.hash.clone(),
-                    }),
+                    left: Some(l.to_file_info()),
+                    right: Some(r.to_file_info()),
                 };
             }
 
@@ -298,6 +309,8 @@ fn determine_action(
                 return SyncAction::Skip {
                     path: path_buf,
                     reason: "Files are identical".to_string(),
+                    size: l.size,
+                    is_directory: false,
                 };
             }
 
@@ -309,16 +322,8 @@ fn determine_action(
                 (true, true) => SyncAction::Conflict {
                     path: path_buf,
                     reason: ConflictReason::BothModified,
-                    left: Some(FileInfo {
-                        size: l.size,
-                        mtime: l.mtime,
-                        hash: l.hash.clone(),
-                    }),
-                    right: Some(FileInfo {
-                        size: r.size,
-                        mtime: r.mtime,
-                        hash: r.hash.clone(),
-                    }),
+                    left: Some(l.to_file_info()),
+                    right: Some(r.to_file_info()),
                 },
                 (true, false) => SyncAction::CopyToRight {
                     path: path_buf,
@@ -331,6 +336,8 @@ fn determine_action(
                 (false, false) => SyncAction::Skip {
                     path: path_buf,
                     reason: "No changes detected".to_string(),
+                    size: l.size,
+                    is_directory: false,
                 },
             }
         }
@@ -342,11 +349,7 @@ fn determine_action(
             let right_del_dir = right_deleted.is_some_and(|d| d.is_dir);
             let right_del_file = right_deleted.is_some_and(|d| !d.is_dir);
 
-            let left_info = || FileInfo {
-                size: l.size,
-                mtime: l.mtime,
-                hash: l.hash.clone(),
-            };
+            let left_info = || l.to_file_info();
 
             if l.is_dir {
                 // Type mismatch: history is for a file, but the left side now has a directory.
@@ -376,7 +379,11 @@ fn determine_action(
                 if right_prev_dir {
                     let left_prev_dir = left_prev.is_some_and(|f| f.is_dir);
                     if left_prev_dir && left_deleted.is_none() {
-                        return SyncAction::DeleteLeft { path: path_buf };
+                        return SyncAction::DeleteLeft {
+                            path: path_buf,
+                            size: 0,
+                            is_directory: true,
+                        };
                     }
                     return SyncAction::Conflict {
                         path: path_buf,
@@ -420,7 +427,11 @@ fn determine_action(
                     }
                 } else {
                     // Not modified on left, deleted on right - delete left
-                    SyncAction::DeleteLeft { path: path_buf }
+                    SyncAction::DeleteLeft {
+                        path: path_buf,
+                        size: l.size,
+                        is_directory: false,
+                    }
                 }
             } else {
                 // New file on left - copy to right
@@ -438,11 +449,7 @@ fn determine_action(
             let left_del_dir = left_deleted.is_some_and(|d| d.is_dir);
             let left_del_file = left_deleted.is_some_and(|d| !d.is_dir);
 
-            let right_info = || FileInfo {
-                size: r.size,
-                mtime: r.mtime,
-                hash: r.hash.clone(),
-            };
+            let right_info = || r.to_file_info();
 
             if r.is_dir {
                 if left_prev_file || left_del_file {
@@ -467,7 +474,11 @@ fn determine_action(
                     // has no leftover tombstone — otherwise `left_prev_dir` is stale.
                     let right_prev_dir = right_prev.is_some_and(|f| f.is_dir);
                     if right_prev_dir && right_deleted.is_none() {
-                        return SyncAction::DeleteRight { path: path_buf };
+                        return SyncAction::DeleteRight {
+                            path: path_buf,
+                            size: 0,
+                            is_directory: true,
+                        };
                     }
                     return SyncAction::Conflict {
                         path: path_buf,
@@ -511,7 +522,11 @@ fn determine_action(
                     }
                 } else {
                     // Not modified on right, deleted on left - delete right
-                    SyncAction::DeleteRight { path: path_buf }
+                    SyncAction::DeleteRight {
+                        path: path_buf,
+                        size: r.size,
+                        is_directory: false,
+                    }
                 }
             } else {
                 // New file on right - copy to left
@@ -526,6 +541,8 @@ fn determine_action(
         (None, None) => SyncAction::Skip {
             path: path_buf,
             reason: "File not found on either side".to_string(),
+            size: 0,
+            is_directory: false,
         },
     }
 }
@@ -872,7 +889,7 @@ mod tests {
         assert_eq!(result.files_to_delete, 1);
         assert!(matches!(
             &result.actions[0],
-            SyncAction::DeleteRight { path } if path == &PathBuf::from("file.txt")
+            SyncAction::DeleteRight { path, .. } if path == &PathBuf::from("file.txt")
         ));
     }
 
@@ -1018,7 +1035,7 @@ mod tests {
 
         assert!(matches!(
             &result.actions[0],
-            SyncAction::DeleteLeft { path } if path == &PathBuf::from("subdir")
+            SyncAction::DeleteLeft { path, .. } if path == &PathBuf::from("subdir")
         ));
     }
 
@@ -1040,7 +1057,7 @@ mod tests {
 
         assert!(matches!(
             &result.actions[0],
-            SyncAction::DeleteRight { path } if path == &PathBuf::from("subdir")
+            SyncAction::DeleteRight { path, .. } if path == &PathBuf::from("subdir")
         ));
     }
 

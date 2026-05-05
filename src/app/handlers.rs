@@ -641,14 +641,24 @@ impl App {
             if let Some(&real_idx) = indices.get(preview.selected) {
                 if let Some(action) = preview.actions.get(real_idx) {
                     let path = action.path().clone();
+                    let is_directory = action.is_directory();
                     // CopyToLeft means source is RIGHT side
                     // If file exists on right, copy to left
                     // If file doesn't exist on right, delete from left
-                    if let Some(size) = preview.get_file_size_from_right(&path) {
-                        preview.actions[real_idx] = UserAction::CopyToLeft { path, size };
+                    let new_action = if let Some(size) = preview.get_file_size_from_right(&path) {
+                        UserAction::CopyToLeft { path, size }
                     } else {
-                        preview.actions[real_idx] = UserAction::DeleteLeft { path };
-                    }
+                        // Preserve size from the existing action so Size sort
+                        // and the UI tag don't lose meaning when the user
+                        // changes a Skip on a known-large file into a Delete.
+                        let size = action.payload_size();
+                        UserAction::DeleteLeft {
+                            path,
+                            size,
+                            is_directory,
+                        }
+                    };
+                    preview.replace_action(real_idx, new_action);
                 }
             }
             preview.restore_selection_to_path(pinned);
@@ -662,14 +672,21 @@ impl App {
             if let Some(&real_idx) = indices.get(preview.selected) {
                 if let Some(action) = preview.actions.get(real_idx) {
                     let path = action.path().clone();
+                    let is_directory = action.is_directory();
                     // CopyToRight means source is LEFT side
                     // If file exists on left, copy to right
                     // If file doesn't exist on left, delete from right
-                    if let Some(size) = preview.get_file_size_from_left(&path) {
-                        preview.actions[real_idx] = UserAction::CopyToRight { path, size };
+                    let new_action = if let Some(size) = preview.get_file_size_from_left(&path) {
+                        UserAction::CopyToRight { path, size }
                     } else {
-                        preview.actions[real_idx] = UserAction::DeleteRight { path };
-                    }
+                        let size = action.payload_size();
+                        UserAction::DeleteRight {
+                            path,
+                            size,
+                            is_directory,
+                        }
+                    };
+                    preview.replace_action(real_idx, new_action);
                 }
             }
             preview.restore_selection_to_path(pinned);
@@ -683,7 +700,16 @@ impl App {
             if let Some(&real_idx) = indices.get(preview.selected) {
                 if let Some(action) = preview.actions.get(real_idx) {
                     let path = action.path().clone();
-                    preview.actions[real_idx] = UserAction::Skip { path };
+                    let size = action.payload_size();
+                    let is_directory = action.is_directory();
+                    preview.replace_action(
+                        real_idx,
+                        UserAction::Skip {
+                            path,
+                            size,
+                            is_directory,
+                        },
+                    );
                 }
             }
             preview.restore_selection_to_path(pinned);

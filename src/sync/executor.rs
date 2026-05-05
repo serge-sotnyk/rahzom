@@ -231,7 +231,7 @@ fn action_order(action: &SyncAction) -> (u8, usize) {
             (1, path.components().count())
         }
         // Deletes last, sorted by depth (deep first so children go before parents)
-        SyncAction::DeleteLeft { path } | SyncAction::DeleteRight { path } => {
+        SyncAction::DeleteLeft { path, .. } | SyncAction::DeleteRight { path, .. } => {
             (2, usize::MAX - path.components().count())
         }
         // Skip and Conflict at the very end
@@ -304,8 +304,8 @@ impl Executor {
         match action {
             SyncAction::CopyToRight { path, .. }
             | SyncAction::CopyToLeft { path, .. }
-            | SyncAction::DeleteRight { path }
-            | SyncAction::DeleteLeft { path }
+            | SyncAction::DeleteRight { path, .. }
+            | SyncAction::DeleteLeft { path, .. }
             | SyncAction::CreateDirRight { path }
             | SyncAction::CreateDirLeft { path }
             | SyncAction::Skip { path, .. }
@@ -329,12 +329,12 @@ impl Executor {
                 let dst = self.left_root.join(path);
                 self.verify_and_copy(&src, &dst, path, *size, snapshots)
             }
-            SyncAction::DeleteRight { path } => {
+            SyncAction::DeleteRight { path, .. } => {
                 let target = self.right_root.join(path);
                 self.delete_file(&target, &self.right_root)?;
                 Ok(Some(0))
             }
-            SyncAction::DeleteLeft { path } => {
+            SyncAction::DeleteLeft { path, .. } => {
                 let target = self.left_root.join(path);
                 self.delete_file(&target, &self.left_root)?;
                 Ok(Some(0))
@@ -782,6 +782,8 @@ mod tests {
 
         let actions = vec![SyncAction::DeleteRight {
             path: PathBuf::from("to_delete.txt"),
+            size: 9,
+            is_directory: false,
         }];
 
         let result = executor
@@ -815,6 +817,8 @@ mod tests {
 
         let actions = vec![SyncAction::DeleteRight {
             path: PathBuf::from("to_delete.txt"),
+            size: 9,
+            is_directory: false,
         }];
 
         let result = executor
@@ -944,6 +948,8 @@ mod tests {
         let actions = vec![
             SyncAction::DeleteRight {
                 path: PathBuf::from("to_delete.txt"),
+                size: 6,
+                is_directory: false,
             },
             SyncAction::CopyToRight {
                 path: PathBuf::from("file.txt"),
@@ -1072,6 +1078,8 @@ mod tests {
         let actions = vec![
             SyncAction::DeleteRight {
                 path: PathBuf::from("a"),
+                size: 0,
+                is_directory: true,
             },
             SyncAction::CopyToRight {
                 path: PathBuf::from("foo.txt"),
@@ -1079,12 +1087,16 @@ mod tests {
             },
             SyncAction::DeleteRight {
                 path: PathBuf::from("a/b/c"),
+                size: 0,
+                is_directory: true,
             },
             SyncAction::CreateDirLeft {
                 path: PathBuf::from("newdir"),
             },
             SyncAction::DeleteRight {
                 path: PathBuf::from("a/b"),
+                size: 0,
+                is_directory: true,
             },
         ];
 
@@ -1104,7 +1116,7 @@ mod tests {
         let delete_paths: Vec<&Path> = sorted
             .iter()
             .filter_map(|a| match a {
-                SyncAction::DeleteRight { path } | SyncAction::DeleteLeft { path } => {
+                SyncAction::DeleteRight { path, .. } | SyncAction::DeleteLeft { path, .. } => {
                     Some(path.as_path())
                 }
                 _ => None,

@@ -626,7 +626,7 @@ impl App {
                     left_meta.upsert_file(file_state.clone());
                     right_meta.upsert_file(file_state);
                 }
-                SyncAction::DeleteRight { path } | SyncAction::DeleteLeft { path } => {
+                SyncAction::DeleteRight { path, .. } | SyncAction::DeleteLeft { path, .. } => {
                     // A propagated deletion means the path is gone from both
                     // sides' filesystems by the time sync completes. Tombstone
                     // both metadatas so a stale `files` record on the side

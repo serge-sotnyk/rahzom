@@ -190,7 +190,8 @@ pub fn render_preview(
                 let action = &preview.actions[real_idx];
                 let is_selected = display_idx + scroll_offset == preview.selected;
                 let is_marked = preview.selected_items.contains(&real_idx);
-                render_action_item(action, is_selected, is_marked, row_width)
+                let effective_size = preview.effective_size(action);
+                render_action_item(action, is_selected, is_marked, row_width, effective_size)
             })
             .collect();
 
@@ -313,13 +314,18 @@ pub fn render_summary(frame: &mut Frame, area: Rect, summary: &PreviewSummary) {
 /// Render a single action item in the preview list. The full row width is
 /// passed in so the path can be middle-truncated to fit; trailing tags
 /// (size, conflict reason) are reserved first so the user keeps that context.
+///
+/// `effective_size` is the size used by the trailing tag for Skip/Delete
+/// rows (file size for files, aggregated subtree size for directories).
+/// Pass 0 to suppress the size tag.
 pub fn render_action_item(
     action: &UserAction,
     is_selected: bool,
     is_marked: bool,
     row_width: usize,
+    effective_size: u64,
 ) -> ListItem<'static> {
-    let (symbol, color, path_str, tag) = decompose_action(action);
+    let (symbol, color, path_str, tag) = decompose_action(action, effective_size);
 
     let marker = if is_marked { "● " } else { "  " };
     let modified_indicator = if action.is_modified() { "*" } else { "" };
@@ -359,7 +365,21 @@ pub fn render_action_item(
 }
 
 /// Returns (symbol, color, path_string, optional_trailing_tag_with_leading_space).
-fn decompose_action(action: &UserAction) -> (&'static str, Color, String, Option<String>) {
+///
+/// For Skip / Delete rows the tag is the effective size (file size, or
+/// aggregated subtree size for directories) when greater than zero; this
+/// makes Size-sort changes visible and gives the user a sense of weight.
+fn decompose_action(
+    action: &UserAction,
+    effective_size: u64,
+) -> (&'static str, Color, String, Option<String>) {
+    let size_tag = |s: u64| {
+        if s == 0 {
+            None
+        } else {
+            Some(format!(" ({})", format_bytes(s)))
+        }
+    };
     match action {
         UserAction::Original(SyncAction::CopyToRight { path, size }) => (
             "→",
@@ -373,18 +393,30 @@ fn decompose_action(action: &UserAction) -> (&'static str, Color, String, Option
             path.display().to_string(),
             Some(format!(" ({})", format_bytes(*size))),
         ),
-        UserAction::Original(SyncAction::DeleteRight { path }) => {
-            ("✕→", Color::Red, path.display().to_string(), None)
-        }
-        UserAction::Original(SyncAction::DeleteLeft { path }) => {
-            ("←✕", Color::Red, path.display().to_string(), None)
-        }
-        UserAction::Original(SyncAction::CreateDirRight { path }) => {
-            ("📁→", Color::Green, path.display().to_string(), None)
-        }
-        UserAction::Original(SyncAction::CreateDirLeft { path }) => {
-            ("←📁", Color::Blue, path.display().to_string(), None)
-        }
+        UserAction::Original(SyncAction::DeleteRight { path, .. }) => (
+            "✕→",
+            Color::Red,
+            path.display().to_string(),
+            size_tag(effective_size),
+        ),
+        UserAction::Original(SyncAction::DeleteLeft { path, .. }) => (
+            "←✕",
+            Color::Red,
+            path.display().to_string(),
+            size_tag(effective_size),
+        ),
+        UserAction::Original(SyncAction::CreateDirRight { path }) => (
+            "📁→",
+            Color::Green,
+            path.display().to_string(),
+            size_tag(effective_size),
+        ),
+        UserAction::Original(SyncAction::CreateDirLeft { path }) => (
+            "←📁",
+            Color::Blue,
+            path.display().to_string(),
+            size_tag(effective_size),
+        ),
         UserAction::Original(SyncAction::Conflict { path, reason, .. }) => {
             let reason_str = conflict_reason_label(reason);
             (
@@ -394,9 +426,12 @@ fn decompose_action(action: &UserAction) -> (&'static str, Color, String, Option
                 Some(format!(" ({})", reason_str)),
             )
         }
-        UserAction::Original(SyncAction::Skip { path, .. }) => {
-            ("·", Color::DarkGray, path.display().to_string(), None)
-        }
+        UserAction::Original(SyncAction::Skip { path, .. }) => (
+            "·",
+            Color::DarkGray,
+            path.display().to_string(),
+            size_tag(effective_size),
+        ),
         UserAction::CopyToRight { path, size } => (
             "→*",
             Color::Green,
@@ -409,9 +444,24 @@ fn decompose_action(action: &UserAction) -> (&'static str, Color, String, Option
             path.display().to_string(),
             Some(format!(" ({})", format_bytes(*size))),
         ),
-        UserAction::DeleteLeft { path } => ("←✕*", Color::Red, path.display().to_string(), None),
-        UserAction::DeleteRight { path } => ("✕→*", Color::Red, path.display().to_string(), None),
-        UserAction::Skip { path } => ("·*", Color::DarkGray, path.display().to_string(), None),
+        UserAction::DeleteLeft { path, .. } => (
+            "←✕*",
+            Color::Red,
+            path.display().to_string(),
+            size_tag(effective_size),
+        ),
+        UserAction::DeleteRight { path, .. } => (
+            "✕→*",
+            Color::Red,
+            path.display().to_string(),
+            size_tag(effective_size),
+        ),
+        UserAction::Skip { path, .. } => (
+            "·*",
+            Color::DarkGray,
+            path.display().to_string(),
+            size_tag(effective_size),
+        ),
     }
 }
 

@@ -148,8 +148,8 @@ pub fn render_sync_complete(frame: &mut Frame, area: Rect, complete: &SyncComple
                 let path = match &f.action {
                     SyncAction::CopyToRight { path, .. }
                     | SyncAction::CopyToLeft { path, .. }
-                    | SyncAction::DeleteRight { path }
-                    | SyncAction::DeleteLeft { path }
+                    | SyncAction::DeleteRight { path, .. }
+                    | SyncAction::DeleteLeft { path, .. }
                     | SyncAction::CreateDirRight { path }
                     | SyncAction::CreateDirLeft { path }
                     | SyncAction::Conflict { path, .. }
