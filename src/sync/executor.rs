@@ -208,6 +208,37 @@ const METADATA_DIR: &str = ".rahzom";
 const TRASH_DIR: &str = "_trash";
 const BACKUP_DIR: &str = "_backup";
 
+/// Sorts sync actions into the order they must be executed in:
+/// directory creations first (shallow → deep), then copies, then deletes
+/// (deep → shallow so non-empty parents get emptied before being removed).
+///
+/// Callers that drive the executor incrementally (e.g. one action per frame)
+/// must run this once on the full batch, since `Executor::execute` only sorts
+/// what is passed in a single call.
+pub fn sort_actions(mut actions: Vec<SyncAction>) -> Vec<SyncAction> {
+    actions.sort_by_key(action_order);
+    actions
+}
+
+fn action_order(action: &SyncAction) -> (u8, usize) {
+    match action {
+        // Directories first, sorted by depth (shallow first)
+        SyncAction::CreateDirLeft { path } | SyncAction::CreateDirRight { path } => {
+            (0, path.components().count())
+        }
+        // Copies second
+        SyncAction::CopyToLeft { path, .. } | SyncAction::CopyToRight { path, .. } => {
+            (1, path.components().count())
+        }
+        // Deletes last, sorted by depth (deep first so children go before parents)
+        SyncAction::DeleteLeft { path } | SyncAction::DeleteRight { path } => {
+            (2, usize::MAX - path.components().count())
+        }
+        // Skip and Conflict at the very end
+        SyncAction::Skip { .. } | SyncAction::Conflict { .. } => (3, 0),
+    }
+}
+
 /// Executes sync actions between two directories.
 pub struct Executor {
     left_root: PathBuf,
@@ -232,7 +263,7 @@ impl Executor {
         snapshots: &std::collections::HashMap<PathBuf, FileSnapshot>,
         progress: &mut dyn ProgressCallback,
     ) -> Result<ExecutionResult> {
-        let sorted_actions = self.sort_actions(actions);
+        let sorted_actions = sort_actions(actions);
         let total = sorted_actions.len();
         let mut result = ExecutionResult::default();
 
@@ -267,35 +298,6 @@ impl Executor {
         }
 
         Ok(result)
-    }
-
-    /// Sorts actions for proper execution order
-    fn sort_actions(&self, mut actions: Vec<SyncAction>) -> Vec<SyncAction> {
-        actions.sort_by(|a, b| {
-            let order_a = self.action_order(a);
-            let order_b = self.action_order(b);
-            order_a.cmp(&order_b)
-        });
-        actions
-    }
-
-    fn action_order(&self, action: &SyncAction) -> (u8, usize, bool) {
-        match action {
-            // Directories first, sorted by depth (shallow first)
-            SyncAction::CreateDirLeft { path } | SyncAction::CreateDirRight { path } => {
-                (0, path.components().count(), false)
-            }
-            // Copies second
-            SyncAction::CopyToLeft { path, .. } | SyncAction::CopyToRight { path, .. } => {
-                (1, path.components().count(), false)
-            }
-            // Deletes last, sorted by depth (deep first for directories)
-            SyncAction::DeleteLeft { path } | SyncAction::DeleteRight { path } => {
-                (2, usize::MAX - path.components().count(), true)
-            }
-            // Skip and Conflict at the end
-            SyncAction::Skip { .. } | SyncAction::Conflict { .. } => (3, 0, false),
-        }
     }
 
     fn action_path<'a>(&self, action: &'a SyncAction) -> &'a Path {
@@ -1059,6 +1061,59 @@ mod tests {
             (dst_attrs & 0x2) != 0,
             "Destination should be hidden (attrs: {:#x})",
             dst_attrs
+        );
+    }
+
+    #[test]
+    fn test_sort_actions_orders_deletes_deepest_first() {
+        // Mixed batch — sort_actions must produce: CreateDir → Copy → Delete,
+        // and within Delete, deeper paths come first so non-empty parents
+        // get emptied before being removed.
+        let actions = vec![
+            SyncAction::DeleteRight {
+                path: PathBuf::from("a"),
+            },
+            SyncAction::CopyToRight {
+                path: PathBuf::from("foo.txt"),
+                size: 1,
+            },
+            SyncAction::DeleteRight {
+                path: PathBuf::from("a/b/c"),
+            },
+            SyncAction::CreateDirLeft {
+                path: PathBuf::from("newdir"),
+            },
+            SyncAction::DeleteRight {
+                path: PathBuf::from("a/b"),
+            },
+        ];
+
+        let sorted = sort_actions(actions);
+
+        let kinds: Vec<&str> = sorted
+            .iter()
+            .map(|a| match a {
+                SyncAction::CreateDirLeft { .. } | SyncAction::CreateDirRight { .. } => "create",
+                SyncAction::CopyToLeft { .. } | SyncAction::CopyToRight { .. } => "copy",
+                SyncAction::DeleteLeft { .. } | SyncAction::DeleteRight { .. } => "delete",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["create", "copy", "delete", "delete", "delete"]);
+
+        let delete_paths: Vec<&Path> = sorted
+            .iter()
+            .filter_map(|a| match a {
+                SyncAction::DeleteRight { path } | SyncAction::DeleteLeft { path } => {
+                    Some(path.as_path())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delete_paths,
+            vec![Path::new("a/b/c"), Path::new("a/b"), Path::new("a"),],
+            "deletes must be deepest-first"
         );
     }
 }

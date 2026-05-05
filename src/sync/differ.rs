@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
-use super::metadata::SyncMetadata;
+use super::metadata::{DeletedFile, FileState, SyncMetadata};
 use super::scanner::ScanResult;
 use super::utils::FAT32_TOLERANCE_SECS;
 
@@ -202,6 +202,7 @@ pub fn diff(
         let left_prev = left_meta.find_file(path);
         let right_prev = right_meta.find_file(path);
         let right_deleted = right_meta.find_deleted(path);
+        let left_deleted = left_meta.find_deleted(path);
 
         let action = determine_action(
             path,
@@ -209,8 +210,8 @@ pub fn diff(
             right_entry,
             left_prev,
             right_prev,
-            right_deleted.is_some(),
-            false, // left_deleted
+            right_deleted,
+            left_deleted,
         );
 
         result.add_action(action);
@@ -232,6 +233,7 @@ pub fn diff(
         let left_prev = left_meta.find_file(path);
         let right_prev = right_meta.find_file(path);
         let left_deleted = left_meta.find_deleted(path);
+        let right_deleted = right_meta.find_deleted(path);
 
         let action = determine_action(
             path,
@@ -239,8 +241,8 @@ pub fn diff(
             Some(right_entry),
             left_prev,
             right_prev,
-            false, // right_deleted
-            left_deleted.is_some(),
+            right_deleted,
+            left_deleted,
         );
 
         result.add_action(action);
@@ -254,10 +256,10 @@ fn determine_action(
     path: &str,
     left: Option<&FileEntry>,
     right: Option<&FileEntry>,
-    left_prev: Option<&super::metadata::FileState>,
-    right_prev: Option<&super::metadata::FileState>,
-    right_deleted: bool,
-    left_deleted: bool,
+    left_prev: Option<&FileState>,
+    right_prev: Option<&FileState>,
+    right_deleted: Option<&DeletedFile>,
+    left_deleted: Option<&DeletedFile>,
 ) -> SyncAction {
     let path_buf = PathBuf::from(path);
 
@@ -335,29 +337,77 @@ fn determine_action(
 
         // File only on left side
         (Some(l), None) => {
+            let right_prev_dir = right_prev.is_some_and(|f| f.is_dir);
+            let right_prev_file = right_prev.is_some_and(|f| !f.is_dir);
+            let right_del_dir = right_deleted.is_some_and(|d| d.is_dir);
+            let right_del_file = right_deleted.is_some_and(|d| !d.is_dir);
+
+            let left_info = || FileInfo {
+                size: l.size,
+                mtime: l.mtime,
+                hash: l.hash.clone(),
+            };
+
             if l.is_dir {
-                // Directory was synchronized before but is gone on the right —
-                // propagate the deletion. mtime/size of directories is not
-                // meaningful, so we treat presence in metadata as "unmodified".
-                if right_deleted || right_prev.is_some() {
-                    return SyncAction::DeleteLeft { path: path_buf };
+                // Type mismatch: history is for a file, but the left side now has a directory.
+                if right_prev_file || right_del_file {
+                    return SyncAction::Conflict {
+                        path: path_buf,
+                        reason: ConflictReason::ExistsVsDeleted,
+                        left: Some(left_info()),
+                        right: None,
+                    };
+                }
+                // Directory was synced before, then deleted on the right (tombstone present).
+                if right_del_dir {
+                    return SyncAction::Conflict {
+                        path: path_buf,
+                        reason: ConflictReason::ExistsVsDeleted,
+                        left: Some(left_info()),
+                        right: None,
+                    };
+                }
+                // Directory was synchronized, then disappeared on the right — propagate deletion.
+                // But only when the local side ALSO records the directory as a previous
+                // dir entry and has no leftover tombstone: otherwise `right_prev_dir` is
+                // likely stale (e.g. we already propagated the deletion before, and the
+                // dir we see now is freshly created), and silently re-deleting it would
+                // destroy the user's new content.
+                if right_prev_dir {
+                    let left_prev_dir = left_prev.is_some_and(|f| f.is_dir);
+                    if left_prev_dir && left_deleted.is_none() {
+                        return SyncAction::DeleteLeft { path: path_buf };
+                    }
+                    return SyncAction::Conflict {
+                        path: path_buf,
+                        reason: ConflictReason::ExistsVsDeleted,
+                        left: Some(left_info()),
+                        right: None,
+                    };
                 }
                 return SyncAction::CreateDirRight { path: path_buf };
             }
 
-            if right_deleted {
+            // Left is a file. If history says the path was a directory, surface as conflict
+            // instead of treating it like a deleted file.
+            if right_prev_dir || right_del_dir {
+                return SyncAction::Conflict {
+                    path: path_buf,
+                    reason: ConflictReason::ExistsVsDeleted,
+                    left: Some(left_info()),
+                    right: None,
+                };
+            }
+
+            if right_del_file {
                 // Was deleted on right - conflict
                 SyncAction::Conflict {
                     path: path_buf,
                     reason: ConflictReason::ExistsVsDeleted,
-                    left: Some(FileInfo {
-                        size: l.size,
-                        mtime: l.mtime,
-                        hash: l.hash.clone(),
-                    }),
+                    left: Some(left_info()),
                     right: None,
                 }
-            } else if right_prev.is_some() {
+            } else if right_prev_file {
                 // Existed before on right but now gone - was deleted
                 let left_changed = left_prev.is_none() || file_changed_since(l, left_prev.unwrap());
                 if left_changed {
@@ -365,11 +415,7 @@ fn determine_action(
                     SyncAction::Conflict {
                         path: path_buf,
                         reason: ConflictReason::ModifiedAndDeleted,
-                        left: Some(FileInfo {
-                            size: l.size,
-                            mtime: l.mtime,
-                            hash: l.hash.clone(),
-                        }),
+                        left: Some(left_info()),
                         right: None,
                     }
                 } else {
@@ -387,26 +433,71 @@ fn determine_action(
 
         // File only on right side
         (None, Some(r)) => {
+            let left_prev_dir = left_prev.is_some_and(|f| f.is_dir);
+            let left_prev_file = left_prev.is_some_and(|f| !f.is_dir);
+            let left_del_dir = left_deleted.is_some_and(|d| d.is_dir);
+            let left_del_file = left_deleted.is_some_and(|d| !d.is_dir);
+
+            let right_info = || FileInfo {
+                size: r.size,
+                mtime: r.mtime,
+                hash: r.hash.clone(),
+            };
+
             if r.is_dir {
-                if left_deleted || left_prev.is_some() {
-                    return SyncAction::DeleteRight { path: path_buf };
+                if left_prev_file || left_del_file {
+                    return SyncAction::Conflict {
+                        path: path_buf,
+                        reason: ConflictReason::ExistsVsDeleted,
+                        left: None,
+                        right: Some(right_info()),
+                    };
+                }
+                if left_del_dir {
+                    return SyncAction::Conflict {
+                        path: path_buf,
+                        reason: ConflictReason::ExistsVsDeleted,
+                        left: None,
+                        right: Some(right_info()),
+                    };
+                }
+                if left_prev_dir {
+                    // Mirror of the (Some, None) directory rule: only propagate when the
+                    // right side also confirms the dir was previously synchronized and
+                    // has no leftover tombstone — otherwise `left_prev_dir` is stale.
+                    let right_prev_dir = right_prev.is_some_and(|f| f.is_dir);
+                    if right_prev_dir && right_deleted.is_none() {
+                        return SyncAction::DeleteRight { path: path_buf };
+                    }
+                    return SyncAction::Conflict {
+                        path: path_buf,
+                        reason: ConflictReason::ExistsVsDeleted,
+                        left: None,
+                        right: Some(right_info()),
+                    };
                 }
                 return SyncAction::CreateDirLeft { path: path_buf };
             }
 
-            if left_deleted {
+            // Right is a file. If history says the path was a directory, surface as conflict.
+            if left_prev_dir || left_del_dir {
+                return SyncAction::Conflict {
+                    path: path_buf,
+                    reason: ConflictReason::ExistsVsDeleted,
+                    left: None,
+                    right: Some(right_info()),
+                };
+            }
+
+            if left_del_file {
                 // Was deleted on left - conflict
                 SyncAction::Conflict {
                     path: path_buf,
                     reason: ConflictReason::ExistsVsDeleted,
                     left: None,
-                    right: Some(FileInfo {
-                        size: r.size,
-                        mtime: r.mtime,
-                        hash: r.hash.clone(),
-                    }),
+                    right: Some(right_info()),
                 }
-            } else if left_prev.is_some() {
+            } else if left_prev_file {
                 // Existed before on left but now gone - was deleted
                 let right_changed =
                     right_prev.is_none() || file_changed_since(r, right_prev.unwrap());
@@ -416,11 +507,7 @@ fn determine_action(
                         path: path_buf,
                         reason: ConflictReason::ModifiedAndDeleted,
                         left: None,
-                        right: Some(FileInfo {
-                            size: r.size,
-                            mtime: r.mtime,
-                            hash: r.hash.clone(),
-                        }),
+                        right: Some(right_info()),
                     }
                 } else {
                     // Not modified on right, deleted on left - delete right
@@ -551,7 +638,7 @@ fn detect_case_conflicts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::metadata::{FileAttributes, FileState, SyncMetadata};
+    use crate::sync::metadata::{DeletedFile, FileAttributes, FileState, SyncMetadata};
     use crate::sync::scanner::{FileEntry as ScanFileEntry, ScanResult};
     use chrono::{Duration, Utc};
 
@@ -598,6 +685,17 @@ mod tests {
             attributes: FileAttributes::default(),
             last_synced: Utc::now(),
             is_dir: true,
+        }
+    }
+
+    fn make_deleted(path: &str, is_dir: bool) -> DeletedFile {
+        DeletedFile {
+            path: path.to_string(),
+            size: 0,
+            mtime: Utc::now(),
+            hash: None,
+            deleted_at: Utc::now(),
+            is_dir,
         }
     }
 
@@ -986,6 +1084,210 @@ mod tests {
             &result.actions[0],
             SyncAction::Conflict {
                 reason: ConflictReason::BothModified,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_dir_with_file_tombstone_creates_conflict() {
+        // Finding 1 regression: a file at path `x` was deleted (tombstone with
+        // is_dir=false stays in `right_meta.deleted`), then the user creates a
+        // directory `x/` on the left. The differ must NOT propose DeleteLeft —
+        // that would silently destroy the new directory. Surface as a conflict.
+        let mut left_scan = empty_scan("/left");
+        left_scan.entries.push(make_dir_entry("x"));
+
+        let right_scan = empty_scan("/right");
+
+        let left_meta = SyncMetadata::new();
+        let mut right_meta = SyncMetadata::new();
+        right_meta.deleted.push(make_deleted("x", false));
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::Conflict {
+                reason: ConflictReason::ExistsVsDeleted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_dir_with_file_prev_creates_conflict() {
+        // Symmetric variant: previous metadata records the path as a FILE,
+        // but now there is a directory on the left and nothing on the right.
+        let mut left_scan = empty_scan("/left");
+        left_scan.entries.push(make_dir_entry("x"));
+
+        let right_scan = empty_scan("/right");
+
+        let left_meta = SyncMetadata::new();
+        let mut right_meta = SyncMetadata::new();
+        right_meta.files.push(make_file_state("x", 10, Utc::now()));
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::Conflict {
+                reason: ConflictReason::ExistsVsDeleted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_dir_with_dir_tombstone_creates_conflict() {
+        // Tombstone says the directory was deleted via rahzom, yet it still
+        // exists on the left. Mirror the file ExistsVsDeleted behavior.
+        let mut left_scan = empty_scan("/left");
+        left_scan.entries.push(make_dir_entry("x"));
+
+        let right_scan = empty_scan("/right");
+
+        let left_meta = SyncMetadata::new();
+        let mut right_meta = SyncMetadata::new();
+        right_meta.deleted.push(make_deleted("x", true));
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::Conflict {
+                reason: ConflictReason::ExistsVsDeleted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_file_with_dir_prev_creates_conflict() {
+        // Inverse Finding 1: history says the path was a directory, but the
+        // left side now has a file. Must surface as conflict.
+        let now = Utc::now();
+        let mut left_scan = empty_scan("/left");
+        left_scan.entries.push(make_scan_entry("x", 10, now));
+
+        let right_scan = empty_scan("/right");
+
+        let left_meta = SyncMetadata::new();
+        let mut right_meta = SyncMetadata::new();
+        right_meta.files.push(make_dir_state("x"));
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::Conflict {
+                reason: ConflictReason::ExistsVsDeleted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_file_with_dir_tombstone_creates_conflict() {
+        // Inverse with tombstone: previous record says directory was deleted,
+        // and the user now created a file at the same path on the left.
+        let now = Utc::now();
+        let mut left_scan = empty_scan("/left");
+        left_scan.entries.push(make_scan_entry("x", 10, now));
+
+        let right_scan = empty_scan("/right");
+
+        let left_meta = SyncMetadata::new();
+        let mut right_meta = SyncMetadata::new();
+        right_meta.deleted.push(make_deleted("x", true));
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::Conflict {
+                reason: ConflictReason::ExistsVsDeleted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_dir_recreated_after_propagated_delete_creates_conflict() {
+        // Finding 3 regression: after a propagated DeleteLeft on dir `x`, the
+        // 0.14.2 implementation tombstoned only `left_meta` and left a stale
+        // `files["x"]` entry on `right_meta`. If the user then creates a fresh
+        // `x/` on the left, the differ must NOT treat the stale `right_prev_dir`
+        // as authority to delete the new directory — it must surface a conflict.
+        let mut left_scan = empty_scan("/left");
+        left_scan.entries.push(make_dir_entry("x"));
+
+        let right_scan = empty_scan("/right");
+
+        let mut left_meta = SyncMetadata::new();
+        left_meta.deleted.push(make_deleted("x", true));
+
+        let mut right_meta = SyncMetadata::new();
+        right_meta.files.push(make_dir_state("x"));
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::Conflict {
+                reason: ConflictReason::ExistsVsDeleted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_dir_recreated_after_propagated_delete_creates_conflict_symmetric() {
+        // Mirror of the previous test for the (None, Some) branch.
+        let left_scan = empty_scan("/left");
+
+        let mut right_scan = empty_scan("/right");
+        right_scan.entries.push(make_dir_entry("x"));
+
+        let mut left_meta = SyncMetadata::new();
+        left_meta.files.push(make_dir_state("x"));
+
+        let mut right_meta = SyncMetadata::new();
+        right_meta.deleted.push(make_deleted("x", true));
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::Conflict {
+                reason: ConflictReason::ExistsVsDeleted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_dir_propagated_delete_requires_local_dir_record() {
+        // Only one side claims a previous dir record; the other has nothing
+        // (no files entry, no tombstone). The dir we see now is a fresh
+        // creation — propagating a delete based solely on `right_prev_dir`
+        // would be unsafe, so we expect a Conflict.
+        let mut left_scan = empty_scan("/left");
+        left_scan.entries.push(make_dir_entry("x"));
+
+        let right_scan = empty_scan("/right");
+
+        let left_meta = SyncMetadata::new();
+        let mut right_meta = SyncMetadata::new();
+        right_meta.files.push(make_dir_state("x"));
+
+        let result = diff(&left_scan, &right_scan, &left_meta, &right_meta);
+
+        assert!(matches!(
+            &result.actions[0],
+            SyncAction::Conflict {
+                reason: ConflictReason::ExistsVsDeleted,
                 ..
             }
         ));

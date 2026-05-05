@@ -26,8 +26,8 @@ use crate::config::project::{Project, ProjectManager};
 use crate::sync::differ::{diff, SyncAction};
 use crate::sync::exclusions::Exclusions;
 use crate::sync::executor::{
-    check_disk_space, ExecutionResult, Executor, ExecutorConfig, FailedAction, FileSnapshot,
-    NoopProgress, SyncErrorKind,
+    check_disk_space, sort_actions, ExecutionResult, Executor, ExecutorConfig, FailedAction,
+    FileSnapshot, NoopProgress, SyncErrorKind,
 };
 use crate::sync::metadata::{DeletedFile, FileAttributes, FileState, SyncMetadata};
 use crate::sync::scanner::scan_with_exclusions;
@@ -286,12 +286,16 @@ impl App {
             return;
         };
 
-        // Convert UserActions to SyncActions, filtering out Skip/Conflict
+        // Convert UserActions to SyncActions, filtering out Skip/Conflict.
+        // Sort once here so the per-step executor.execute calls below see
+        // children before parents on Delete and shallow before deep on
+        // CreateDir — Executor::execute only sorts what fits in one call.
         let actions: Vec<SyncAction> = preview
             .actions
             .iter()
             .filter_map(|ua| ua.to_sync_action())
             .collect();
+        let actions = sort_actions(actions);
 
         if actions.is_empty() {
             self.dialog = Dialog::Error("No actions to execute".to_string());
@@ -622,35 +626,28 @@ impl App {
                     left_meta.upsert_file(file_state.clone());
                     right_meta.upsert_file(file_state);
                 }
-                SyncAction::DeleteRight { path } => {
-                    let path_str = path.to_string_lossy().to_string();
-                    let was_dir = right_meta
-                        .find_file(&path_str)
-                        .map(|f| f.is_dir)
-                        .unwrap_or(false);
-                    right_meta.mark_deleted(DeletedFile {
-                        path: path_str,
-                        size: 0,
-                        mtime: now,
-                        hash: None,
-                        deleted_at: now,
-                        is_dir: was_dir,
-                    });
-                }
-                SyncAction::DeleteLeft { path } => {
+                SyncAction::DeleteRight { path } | SyncAction::DeleteLeft { path } => {
+                    // A propagated deletion means the path is gone from both
+                    // sides' filesystems by the time sync completes. Tombstone
+                    // both metadatas so a stale `files` record on the side
+                    // that lost the entity OS-level cannot trick a later
+                    // analyze into proposing another (wrong) deletion.
                     let path_str = path.to_string_lossy().to_string();
                     let was_dir = left_meta
                         .find_file(&path_str)
+                        .or_else(|| right_meta.find_file(&path_str))
                         .map(|f| f.is_dir)
                         .unwrap_or(false);
-                    left_meta.mark_deleted(DeletedFile {
-                        path: path_str,
+                    let make = || DeletedFile {
+                        path: path_str.clone(),
                         size: 0,
                         mtime: now,
                         hash: None,
                         deleted_at: now,
                         is_dir: was_dir,
-                    });
+                    };
+                    left_meta.mark_deleted(make());
+                    right_meta.mark_deleted(make());
                 }
                 _ => {}
             }
